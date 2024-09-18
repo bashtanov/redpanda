@@ -11,8 +11,9 @@ from rptest.services.cluster import cluster
 from ducktape.mark import parametrize
 from rptest.tests.data_migrations import DataMigrationsTest
 
-MIB_PER_PARTITION = 4
-PARTITIONS_PER_SHARD = 1000
+MIB_PER_PARTITION = 1
+PARTITIONS_PER_SHARD = 10000
+STOP_TIMEOUT = 5 * 60
 
 
 class DataMigrationsScaleTest(DataMigrationsTest):
@@ -33,3 +34,4 @@ class DataMigrationsScaleTest(DataMigrationsTest):
     def test_migrate(self, topics_count, partitions_count):
         self.do_test_creating_and_listing_migrations(topics_count,
                                                      partitions_count)
+        self.redpanda.stop(timeout=STOP_TIMEOUT)
