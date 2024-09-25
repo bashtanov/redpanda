@@ -236,8 +236,8 @@ class DataMigrationsApiTest(DataMigrationsTest):
                     topics=[workload_ns_topic], consumer_groups=[])
                 out_migration_id = self.create_and_wait(out_migration)
 
-                admin.execute_data_migration_action(out_migration_id,
-                                                    MigrationAction.prepare)
+                self.execute_data_migration_action(out_migration_id,
+                                                   MigrationAction.prepare)
                 if params.cancellation == CancellationStage(
                         'out', 'preparing'):
                     self.wait_for_migration_states(out_migration_id,
@@ -260,8 +260,8 @@ class DataMigrationsApiTest(DataMigrationsTest):
                     return self.cancel_outbound(out_migration_id,
                                                 workload_topic.name, producer)
 
-                admin.execute_data_migration_action(out_migration_id,
-                                                    MigrationAction.execute)
+                self.execute_data_migration_action(out_migration_id,
+                                                   MigrationAction.execute)
                 if params.cancellation == CancellationStage(
                         'out', 'executing'):
                     self.wait_for_migration_states(out_migration_id,
@@ -283,8 +283,8 @@ class DataMigrationsApiTest(DataMigrationsTest):
                     return self.cancel_outbound(out_migration_id,
                                                 workload_topic.name, producer)
 
-                admin.execute_data_migration_action(out_migration_id,
-                                                    MigrationAction.finish)
+                self.execute_data_migration_action(out_migration_id,
+                                                   MigrationAction.finish)
 
                 self.validate_topic_access(topic=workload_topic.name,
                                            metadata_locked=True,
@@ -335,8 +335,8 @@ class DataMigrationsApiTest(DataMigrationsTest):
                         expected_to_pass=False,
                         operation=lambda topic: rpk.create_topic(topic=topic,
                                                                  replicas=3))
-                    admin.execute_data_migration_action(
-                        in_migration_id, MigrationAction.prepare)
+                    self.execute_data_migration_action(in_migration_id,
+                                                       MigrationAction.prepare)
 
                     if params.cancellation == CancellationStage(
                             'in', 'preparing'):
@@ -374,8 +374,8 @@ class DataMigrationsApiTest(DataMigrationsTest):
                     )
                     assert inbound_topic_name in topics, "workload topic should be present after the inbound migration is prepared"
 
-                    admin.execute_data_migration_action(
-                        in_migration_id, MigrationAction.execute)
+                    self.execute_data_migration_action(in_migration_id,
+                                                       MigrationAction.execute)
                     if params.cancellation == CancellationStage(
                             'in', 'executing'):
                         cancellation = None
@@ -404,8 +404,8 @@ class DataMigrationsApiTest(DataMigrationsTest):
                                             inbound_topic_name)
                         continue
 
-                    admin.execute_data_migration_action(
-                        in_migration_id, MigrationAction.finish)
+                    self.execute_data_migration_action(in_migration_id,
+                                                       MigrationAction.finish)
 
                     self.wait_for_migration_states(in_migration_id,
                                                    ['finished'])
