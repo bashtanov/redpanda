@@ -38,7 +38,11 @@ class DataMigrationsTest(RedpandaTest):
     ] + Finjector.LOG_ALLOW_LIST
     log_segment_size = 10 * 1024
 
-    def __init__(self, test_context: TestContext, *args, **kwargs):
+    def __init__(self,
+                 test_context: TestContext,
+                 *args,
+                 transition_timeout: int = 90,
+                 **kwargs):
         kwargs['si_settings'] = SISettings(
             test_context=test_context,
             log_segment_size=self.log_segment_size,
@@ -47,6 +51,7 @@ class DataMigrationsTest(RedpandaTest):
             cloud_storage_enable_remote_write=True,
         )
         super().__init__(test_context=test_context, *args, **kwargs)
+        self.transition_timeout = transition_timeout
         self.admin = Admin(self.redpanda)
 
     def get_migrations_map(self, node=None):
@@ -96,7 +101,7 @@ class DataMigrationsTest(RedpandaTest):
 
         wait_until(
             migration_in_one_of_states,
-            timeout_sec=90,
+            timeout_sec=self.transition_timeout,
             backoff_sec=1,
             err_msg=
             f"Failed waiting for migration {id} to reach one of {states} states"
@@ -121,7 +126,7 @@ class DataMigrationsTest(RedpandaTest):
 
         wait_until(
             lambda: migration_is_absent(migration_id),
-            timeout_sec=90,
+            timeout_sec=self.transition_timeout,
             backoff_sec=2,
             err_msg=f"Expected migration with id {migration_id} is absent")
 
