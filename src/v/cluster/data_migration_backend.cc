@@ -1353,6 +1353,24 @@ ss::future<> backend::reconcile_existing_topic(
     }
 }
 
+backend::partition_consumer_group_map_t
+backend::build_migration_group_map(const migration_metadata& metadata) const {
+    partition_consumer_group_map_t ret;
+    const auto& groups = std::visit(
+      [](const auto& migration) -> const chunked_vector<consumer_group>& {
+          return migration.groups;
+      },
+      metadata.migration);
+
+    for (const auto& group : groups) {
+        auto partition = _group_proxy.partition_for(group);
+        vassert(partition, "cannot get ntp for group {}", group);
+        auto [it, ins] = ret.try_emplace(*partition);
+        it->second.push_back(group);
+    }
+    return ret;
+}
+
 ss::future<> backend::reconcile_migration(
   migration_reconciliation_state& mrstate, const migration_metadata& metadata) {
     vlog(
@@ -1362,29 +1380,8 @@ ss::future<> backend::reconcile_migration(
       mrstate.scope.sought_state);
 
     if (!mrstate.partition_group_map) {
-        mrstate.partition_group_map.emplace();
-        const auto& groups = std::visit(
-          [](const auto& migration) -> const chunked_vector<consumer_group>& {
-              return migration.groups;
-          },
-          metadata.migration);
-
-        for (const auto& group : groups) {
-            auto partition = _group_proxy.partition_for(group);
-            // Group topic existence has been checked on migration creation.
-            // The only reason to disappear is transient topic table lag.
-            while (!partition) {
-                vlog(
-                  dm_log.warn,
-                  "waiting for group {} to be available in partition map",
-                  group);
-                co_await ss::sleep_abortable(1s, _as);
-                partition = _group_proxy.partition_for(group);
-            }
-            auto [it, ins] = mrstate.partition_group_map->try_emplace(
-              *partition);
-            it->second.push_back(group);
-        }
+        mrstate.partition_group_map.emplace(
+          build_migration_group_map(metadata));
     }
 
     co_await std::visit(
