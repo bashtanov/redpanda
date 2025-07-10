@@ -2,7 +2,8 @@
     "namespace": "cluster::data_migrations",
     "service_name": "data_migrations",
     "includes": [
-        "cluster/data_migration_types.h"
+        "cluster/data_migration_types.h",
+        "cluster/offsets_snapshot.h"
     ],
     "methods": [
         {
@@ -24,6 +25,16 @@
             "name": "check_ntp_states",
             "input_type": "check_ntp_states_request",
             "output_type": "check_ntp_states_reply"
+        },
+        {
+            "name": "get_group_offsets",
+            "input_type": "get_group_offsets_request",
+            "output_type": "get_group_offsets_reply"
+        },
+        {
+            "name": "set_group_offsets",
+            "input_type": "set_group_offsets_request",
+            "output_type": "set_group_offsets_reply"
         }
     ]
 }

@@ -83,6 +83,7 @@ ss::future<errc> retry_loop(retry_chain_node& rcn, TryFunc try_func) {
 backend::backend(
   migrations_table& table,
   frontend& frontend,
+  router& router,
   ss::sharded<worker>& worker,
   partition_leaders_table& leaders_table,
   topics_frontend& topics_frontend,
@@ -98,6 +99,7 @@ backend::backend(
   , _table(table)
   , _frontend(frontend)
   , _worker(worker)
+  , _router(router)
   , _leaders_table(leaders_table)
   , _topics_frontend(topics_frontend)
   , _topic_table(topic_table)
