@@ -281,4 +281,10 @@ std::ostream& operator<<(std::ostream& o, const check_ntp_states_reply& r) {
     return o;
 }
 
+std::ostream& operator<<(std::ostream& o, const entities_status& es) {
+    fmt::print(
+      o, "{{ready_topics: {}, groups: {}}}", es.ready_topics, bool(es.groups));
+    return o;
+}
+
 } // namespace cluster::data_migrations

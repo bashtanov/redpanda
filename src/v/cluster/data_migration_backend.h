@@ -14,6 +14,7 @@
 #include "cluster/data_migration_group_proxy.h"
 #include "cluster/data_migration_router.h"
 #include "cluster/data_migration_table.h"
+#include "cluster/errc.h"
 #include "cluster/shard_table.h"
 #include "cluster/types.h"
 #include "container/chunked_hash_map.h"
@@ -55,6 +56,12 @@ public:
 
     ss::future<> start();
     ss::future<> stop();
+
+    ss::future<result<entities_status, errc>>
+    get_entities_status(id migration_id, bool include_groups);
+
+    ss::future<errc>
+    set_entities_status(id migration_id, entities_status status);
 
 private:
     struct work_scope {
@@ -165,6 +172,7 @@ private:
     void spawn_advances();
 
     /* topic work */
+    void approve_and_schedule_topic_work(topic_map_t::reference);
     void schedule_topic_work(model::topic_namespace nt);
     ss::future<topic_work_result>
     // also resulting future cannot throw when co_awaited

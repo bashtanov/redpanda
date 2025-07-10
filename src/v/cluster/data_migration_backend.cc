@@ -13,8 +13,10 @@
 #include "cloud_storage/topic_manifest.h"
 #include "cloud_storage/topic_manifest_downloader.h"
 #include "cloud_storage/topic_mount_handler.h"
+#include "cluster/offsets_snapshot.h"
 #include "cluster/partition_leaders_table.h"
 #include "config/node_config.h"
+#include "container/chunked_hash_map.h"
 #include "container/chunked_vector.h"
 #include "data_migration_frontend.h"
 #include "data_migration_types.h"
@@ -208,6 +210,368 @@ ss::future<> backend::stop() {
     co_await _worker.invoke_on_all(&worker::stop);
     co_await _gate.close();
     vlog(dm_log.info, "backend stopped");
+}
+
+namespace {
+
+struct topics_status {
+    chunked_vector<model::topic_namespace> ready_topics;
+    bool groups_ready = false;
+
+    template<class TopicsRange>
+    ss::future<> fill_from(TopicsRange&& topics)
+    requires(std::ranges::range<TopicsRange>)
+    {
+        if constexpr (std::ranges::sized_range<TopicsRange>) {
+            ready_topics.reserve(topics.size());
+        }
+        co_await ssx::async_for_each(
+          std::forward<TopicsRange>(topics),
+          [this](const model::topic_namespace& nt) {
+              if (nt == model::kafka_consumer_offsets_nt) {
+                  groups_ready = true;
+              } else {
+                  ready_topics.push_back(nt);
+              }
+          });
+    }
+};
+
+} // namespace
+
+ss::future<result<entities_status, errc>>
+backend::get_entities_status(id migration_id, bool include_groups) {
+    // for safe async iteration
+    auto units = co_await _mutex.get_units(_as);
+    if (!_coordinator_term) {
+        vlog(dm_log.warn, "called on non-coordinator node {}", _self);
+        co_return errc::not_leader_controller;
+    }
+
+    const auto& maybe_meta = _table.get_migration(migration_id);
+    if (!maybe_meta) {
+        vlog(dm_log.trace, "migration {} gone, ignoring", migration_id);
+        co_return errc::data_migration_not_exists;
+    }
+    const auto& meta = maybe_meta->get();
+
+    if (!std::holds_alternative<outbound_migration>(meta.migration)) {
+        vlog(dm_log.warn, "migration {} is not outbound", migration_id);
+        co_return errc::data_migration_not_exists;
+    }
+    const auto& migration = std::get<outbound_migration>(meta.migration);
+
+    topics_status ts;
+    std::optional<chunked_vector<partition_consumer_group_map_t::value_type>>
+      groups_by_partition;
+
+    switch (meta.state) {
+    case state::executing: {
+        auto migration_it = _migration_states.find(migration_id);
+        if (migration_it == _migration_states.end()) {
+            vlog(
+              dm_log.warn,
+              "reconciliation state for migration {} not found",
+              migration_id);
+            // assume we did not start to reconcile yet
+            co_return entities_status{};
+        }
+        const auto& mrstate = migration_it->second;
+        if (mrstate.scope.sought_state != state::executed) {
+            // reconciliation is behind
+            co_return entities_status{};
+        }
+
+        co_await ts.fill_from(
+          migration.topic_nts()
+          | std::views::filter([&mrstate](const model::topic_namespace& nt) {
+                return !mrstate.outstanding_topics.contains(nt);
+            }));
+        if (ts.groups_ready && include_groups) {
+            groups_by_partition.emplace();
+            groups_by_partition->reserve(mrstate.partition_group_map->size());
+            for (const auto& [pid, groups] : *mrstate.partition_group_map) {
+                groups_by_partition->emplace_back(pid, groups.copy());
+            }
+        }
+        break;
+    }
+    case state::executed:
+        // all topics are done
+        co_await ts.fill_from(migration.topic_nts());
+        break;
+    default:
+        vlog(
+          dm_log.warn,
+          "get_entities_status: migration {} is not in executing or executed "
+          "state, current state: {}",
+          migration_id,
+          meta.state);
+        co_return errc::invalid_data_migration_state;
+    }
+
+    result<entities_status, errc> ret{entities_status{
+      .ready_topics = std::move(ts.ready_topics), .groups = std::nullopt}};
+
+    if (ts.groups_ready && include_groups) {
+        ret.assume_value().groups.emplace();
+        auto holder = _gate.hold();
+        if (!groups_by_partition) {
+            groups_by_partition.emplace(
+              std::from_range,
+              build_migration_reconciliation_state(meta)
+                | std::views::as_rvalue);
+        }
+        errc last_errc = errc::success;
+        co_await ss::parallel_for_each(
+          std::move(*groups_by_partition),
+          [this, &ret, &last_errc](auto&& pair) {
+              // TODO: retry per-partition
+              auto&& [pid, groups] = pair;
+              return _router
+                .get_group_offsets(
+                  get_group_offsets_request(pid, std::move(groups)))
+                .then([&ret, pid, &last_errc](get_group_offsets_reply&& reply) {
+                    if (!ret.has_value()) {
+                        // broken by one of the previous results
+                        return;
+                    }
+                    if (reply.ec != errc::success) {
+                        vlog(
+                          dm_log.warn,
+                          "get_group_offsets for partition {} failed: {}",
+                          pid,
+                          reply.ec);
+                        last_errc = reply.ec;
+                    } else {
+                        std::ranges::move(
+                          std::move(reply.group_offsets),
+                          std::back_inserter(*ret.assume_value().groups));
+                    }
+                });
+          });
+        if (last_errc != errc::success) {
+            co_return last_errc;
+        }
+    }
+
+    co_return ret;
+}
+
+ss::future<errc>
+backend::set_entities_status(id migration_id, entities_status status) {
+    // for safe async iteration
+    auto units = co_await _mutex.get_units(_as);
+    if (!_coordinator_term) {
+        vlog(dm_log.warn, "called on non-coordinator node {}", _self);
+        co_return errc::not_leader_controller;
+    }
+
+    const auto& maybe_meta = _table.get_migration(migration_id);
+    if (!maybe_meta) {
+        vlog(dm_log.trace, "migration {} gone, ignoring", migration_id);
+        co_return errc::data_migration_not_exists;
+    }
+    const auto& meta = maybe_meta->get();
+
+    if (!std::holds_alternative<inbound_migration>(meta.migration)) {
+        vlog(dm_log.warn, "migration {} is not inbound", migration_id);
+        co_return errc::data_migration_not_exists;
+    }
+    const auto& migration = std::get<inbound_migration>(meta.migration);
+    if (!migration.await_communication) {
+        vlog(
+          dm_log.info,
+          "migration {} does not require communication, either originally or "
+          "as a result of prior approvals",
+          migration_id);
+        co_return errc::success;
+    }
+    auto migrate_groups = !migration.groups.empty();
+
+    switch (meta.state) {
+    case state::preparing: {
+        auto migration_it = _migration_states.find(migration_id);
+        if (migration_it == _migration_states.end()) {
+            vlog(
+              dm_log.warn,
+              "reconciliation state for migration {} not found",
+              migration_id);
+            // assume we did not start to reconcile yet
+            co_return errc::invalid_data_migration_state;
+        }
+        auto& mrstate = migration_it->second;
+        if (mrstate.scope.sought_state != state::prepared) {
+            // reconciliation is ahead
+            co_return errc::success;
+        }
+
+        // 1) data topics
+        auto& ot = mrstate.outstanding_topics;
+        auto remaining_topics_cnt = ot.size();
+        chunked_hash_set<model::topic_namespace> approved_topics;
+        co_await ssx::async_for_each(
+          status.ready_topics,
+          [this, &ot, migration_id, &approved_topics](
+            model::topic_namespace& nt) {
+              if (nt == model::kafka_consumer_offsets_nt) {
+                  vlog(
+                    dm_log.warn,
+                    "set_entities_status: status of kafka consumer offsets "
+                    "topic should not be set explicitly, migration_id: {}",
+                    migration_id);
+                  return;
+              }
+              if (auto it = ot.find(nt); likely(it != ot.end())) {
+                  approve_and_schedule_topic_work(*it);
+                  approved_topics.insert(std::move(nt));
+              } else {
+                  vlog(
+                    dm_log.info,
+                    "set_entities_status: topic {} is not part of migration {} "
+                    "or has already been approved and processed",
+                    nt,
+                    migration_id);
+              }
+          });
+        remaining_topics_cnt -= approved_topics.size();
+
+        // 2) groups
+        vassert(
+          mrstate.partition_group_map, "partition group map must be filled");
+        if (status.groups) {
+            if (!migrate_groups) {
+                vlog(
+                  dm_log.warn,
+                  "set_entities_status: groups provided for migration {} "
+                  "without groups in migration definition",
+                  migration_id);
+                co_return errc::data_migration_invalid_resources;
+            }
+
+            // valid, as guarded by mutex
+            auto groups_topic_rstate_it = mrstate.outstanding_topics.find(
+              model::kafka_consumer_offsets_nt);
+            bool group_topic_outstanding = groups_topic_rstate_it
+                                           != mrstate.outstanding_topics.end();
+            if (
+              !group_topic_outstanding
+              || groups_topic_rstate_it->second.approved_to_start) {
+                vlog(
+                  dm_log.debug,
+                  "kafka consumer offsets topic does not require approval"
+                  "in migration {}, probably already done",
+                  migration_id);
+            } else {
+                // reverse map is more to make sure we have data for exactly
+                // required groups rather than for lookup
+                chunked_hash_map<kafka::group_id, model::partition_id> rev_map;
+                rev_map.reserve(migration.groups.size());
+                for (const auto& [pid, groups] : *mrstate.partition_group_map) {
+                    co_await ssx::async_for_each(
+                      groups, [&rev_map, pid](const kafka::group_id& group) {
+                          rev_map[group] = pid;
+                      });
+                }
+
+                chunked_hash_map<model::partition_id, group_offsets_snapshot>
+                  requests;
+                requests.reserve(mrstate.partition_group_map->size());
+                for (auto p : *mrstate.partition_group_map | std::views::keys) {
+                    requests[p].offsets_topic_pid = p;
+                };
+                co_await ssx::async_for_each(
+                  std::move(*status.groups),
+                  [&rev_map, &requests, migration_id](group_offsets& group) {
+                      kafka::group_id gid{group.group_id};
+                      if (auto it = rev_map.find(gid);
+                          likely(it != rev_map.end())) {
+                          auto pid = it->second;
+                          requests[pid].groups.push_back(std::move(group));
+                      } else {
+                          vlog(
+                            dm_log.warn,
+                            "set_entities_status: group {} is not part of "
+                            "migration {}",
+                            group.group_id,
+                            migration_id);
+                      }
+                  });
+
+                errc last_error = errc::success;
+                co_await ss::parallel_for_each(
+                  *mrstate.partition_group_map,
+                  [&requests, this, &last_error](const auto& pair) {
+                      auto& [pid, groups] = pair;
+                      auto& request = requests.at(pid);
+                      if (request.groups.empty()) {
+                          vlog(
+                            dm_log.debug,
+                            "set_entities_status: no groups for partition "
+                            "{}",
+                            pid);
+                          return ss::now();
+                      }
+                      return _router
+                        .set_group_offsets(
+                          set_group_offsets_request{std::move(request)})
+                        .then([&last_error](set_group_offsets_reply&& reply) {
+                            if (reply.ec != cluster::errc::success) {
+                                vlog(
+                                  dm_log.warn,
+                                  "set_group_offsets failed: {}",
+                                  reply.ec);
+                                last_error = reply.ec;
+                            }
+                        });
+                  });
+                if (last_error != errc::success) {
+                    co_return last_error;
+                }
+
+                // old iterator may be invalidated
+                auto groups_topic_rstate_it = mrstate.outstanding_topics.find(
+                  model::kafka_consumer_offsets_nt);
+
+                approve_and_schedule_topic_work(*groups_topic_rstate_it);
+            }
+            remaining_topics_cnt -= group_topic_outstanding ? 1 : 0;
+        }
+
+        // 3) persist all-approved state
+        units.return_all();
+        vlog(
+          dm_log.debug,
+          "set_entities_status: migration={} approved_topics={}, "
+          "remaining_topics={}",
+          migration_id,
+          approved_topics.size(),
+          remaining_topics_cnt);
+        if (remaining_topics_cnt != 0) {
+            // not all topics approved, will need further approvals
+            co_return errc::success;
+        }
+        auto ec = co_await _frontend.update_migration_state(
+          migration_id,
+          state::preparing,
+          true,
+          frontend::can_dispatch_to_leader::no);
+        co_return (ec.category() == cluster::error_category())
+          ? cluster::errc(ec.value())
+          : cluster::errc::replication_error;
+    }
+    case state::prepared:
+        // already ahead
+        co_return errc::success;
+    default:
+        vlog(
+          dm_log.warn,
+          "get_entities_status: migration {} is not in preparing or "
+          "prepared state, current state: {}",
+          migration_id,
+          meta.state);
+        co_return errc::invalid_data_migration_state;
+    }
 }
 
 ss::future<> backend::loop_once() {
@@ -434,6 +798,14 @@ ss::future<> backend::send_rpc(model::node_id node_id) {
               return wakeup();
           });
       });
+}
+
+void backend::approve_and_schedule_topic_work(
+  topic_map_t::reference topic_entry) {
+    auto& [nt, tstate] = topic_entry;
+    if (!std::exchange(tstate.approved_to_start, true)) {
+        schedule_topic_work(nt);
+    }
 }
 
 void backend::schedule_topic_work(model::topic_namespace nt) {
