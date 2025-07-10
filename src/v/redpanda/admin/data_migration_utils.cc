@@ -59,7 +59,7 @@ parse_inbound_topics(json::Value& json) {
 
 chunked_vector<model::topic_namespace> parse_topics(json::Value& json) {
     chunked_vector<model::topic_namespace> ret;
-    auto topics_array = json["topics"].GetArray();
+    auto topics_array = json.GetArray();
     ret.reserve(topics_array.Size());
     std::ranges::transform(
       topics_array, std::back_inserter(ret), &parse_topic_namespace);

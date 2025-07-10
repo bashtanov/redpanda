@@ -249,7 +249,7 @@ admin_server::unmount_topics(std::unique_ptr<ss::http::request> req) {
     cluster::data_migrations::outbound_migration migration;
 
     migration.auto_advance = true;
-    migration.topics = parse_topics(json_doc);
+    migration.topics = parse_topics(json_doc["topics"]);
     auto result = co_await _controller->get_data_migration_frontend()
                     .local()
                     .create_migration(std::move(migration));
