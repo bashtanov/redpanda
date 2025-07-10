@@ -247,4 +247,73 @@
             "type": "int"
         }
     }
+},
+"partition_offsets": {
+    "type": "object",
+    "properties": {
+        "partition_id": {
+            "type": "int",
+            "description": "Partition id"
+        },
+        "offset": {
+            "type": "int",
+            "description": "Consumer offset in the partition"
+        }
+    },
+    "required": [
+        "partition_id",
+        "offset"
+    ]
+},
+"topic_partitions_and_offsets": {
+    "type": "object",
+    "properties": {
+        "topic": {
+            "type": "string",
+            "description": "Topic name"
+        },
+        "partitions": {
+            "type": "array",
+            "items": {
+                "$ref": "partition_offsets"
+            },
+            "description": "List of partitions with consumer offsets in them"
+        }
+    },
+    "required": [
+        "topic",
+        "partitions"
+    ]
+},
+"group_consumer_offsets": {
+    "type": "object",
+    "properties": {
+        "group_id": {
+            "type": "string",
+            "description": "Consumer group id"
+        },
+        "topics": {
+            "type": "array",
+            "items": {
+                "$ref": "topic_partitions_and_offsets"
+            },
+            "description": "List of topics with partitions and consumer offsets in them"
+        }
+    },
+    "required": [
+        "group_id",
+        "topics"
+    ]
+},
+"migrated_entities_status": {
+    "type": "object",
+    "properties": {
+        "consumer_groups_data": {
+            "type": "array",
+            "items": {
+                "$ref": "group_consumer_offsets"
+            },
+            "description": "List of consumer groups with data dumped; absent if not requested or not ready yet"
+        }
+    }
 }

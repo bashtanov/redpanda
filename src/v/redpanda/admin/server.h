@@ -701,6 +701,10 @@ private:
       execute_migration_action(std::unique_ptr<ss::http::request>);
     ss::future<ss::json::json_return_type>
       delete_migration(std::unique_ptr<ss::http::request>);
+    ss::future<std::unique_ptr<ss::http::reply>> get_migrated_entities_status(
+      std::unique_ptr<ss::http::request>, std::unique_ptr<ss::http::reply>);
+    ss::future<std::unique_ptr<ss::http::reply>> set_migrated_entities_status(
+      std::unique_ptr<ss::http::request>, std::unique_ptr<ss::http::reply>);
 
     // Topic routes
     ss::future<std::unique_ptr<ss::http::reply>> list_mountable_topics(

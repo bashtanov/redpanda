@@ -11,7 +11,9 @@
 #include "base/vlog.h"
 #include "cluster/controller.h"
 #include "cluster/data_migration_frontend.h"
+#include "cluster/data_migration_irpc_frontend.h"
 #include "cluster/data_migration_types.h"
+#include "cluster/offsets_snapshot.h"
 #include "json/document.h"
 #include "json/validator.h"
 #include "json/writer.h"
@@ -366,6 +368,20 @@ void admin_server::register_data_migration_routes() {
       [this](std::unique_ptr<ss::http::request> req) {
           return delete_migration(std::move(req));
       });
+    register_route_raw_async<superuser>(
+      ss::httpd::migration_json::get_migrated_entities_status,
+      [this](
+        std::unique_ptr<ss::http::request> req,
+        std::unique_ptr<ss::http::reply> reply) {
+          return get_migrated_entities_status(std::move(req), std::move(reply));
+      });
+    register_route_raw_async<superuser>(
+      ss::httpd::migration_json::set_migrated_entities_status,
+      [this](
+        std::unique_ptr<ss::http::request> req,
+        std::unique_ptr<ss::http::reply> reply) {
+          return set_migrated_entities_status(std::move(req), std::move(reply));
+      });
 }
 
 ss::future<std::unique_ptr<ss::http::reply>> admin_server::list_data_migrations(
@@ -453,4 +469,115 @@ admin_server::delete_migration(std::unique_ptr<ss::http::request> req) {
         co_await throw_on_error(*req, ec, model::controller_ntp);
     }
     co_return ss::json::json_void();
+}
+static constexpr auto consumer_groups_data_key = "consumer_groups_data";
+static constexpr auto group_id_key = "group_id";
+static constexpr auto topics_key = "topics";
+static constexpr auto topic_key = "topic";
+static constexpr auto partitions_key = "partitions";
+static constexpr auto partition_key = "partition";
+static constexpr auto offset_key = "offset";
+
+ss::future<std::unique_ptr<ss::http::reply>>
+admin_server::get_migrated_entities_status(
+  std::unique_ptr<ss::http::request> req,
+  std::unique_ptr<ss::http::reply> reply) {
+    auto id = parse_data_migration_id(*req);
+
+    auto& ifrontend = _controller->get_data_migration_irpc_frontend();
+
+    auto entities_status = co_await ifrontend.local().get_entities_status(id);
+
+    if (!entities_status.has_value()) [[unlikely]] {
+        co_await throw_on_error(
+          *req, entities_status.error(), model::controller_ntp);
+        vassert(false, "should have thrown");
+    }
+
+    json::StringBuffer buf;
+    json::Writer<json::StringBuffer> writer(buf);
+    writer.StartObject();
+    ssx::async_counter counter;
+    const auto& groups = entities_status.assume_value().groups;
+    writer.Key(consumer_groups_data_key);
+    writer.StartArray();
+    for (const auto& group : groups) {
+        writer.StartObject();
+        writer.Key(group_id_key);
+        writer.String(group.group_id);
+        writer.Key(topics_key);
+        writer.StartArray();
+        for (const auto& topic : group.offsets) {
+            writer.StartObject();
+            writer.Key(topic_key);
+            writer.String(topic.topic());
+            writer.Key(partitions_key);
+            writer.StartArray();
+            co_await ssx::async_for_each_counter(
+              counter, topic.partitions, [&writer](const auto& partition) {
+                  writer.StartObject();
+                  writer.Key(partition_key);
+                  writer.Int(partition.partition);
+                  writer.Key(offset_key);
+                  writer.Int64(partition.offset);
+                  writer.EndObject();
+              });
+            writer.EndArray();
+            writer.EndObject();
+        }
+        writer.EndArray();
+        writer.EndObject();
+    }
+    writer.EndArray();
+    writer.EndObject();
+    reply->set_status(ss::http::reply::status_type::ok, buf.GetString());
+    co_return std::move(reply);
+}
+
+cluster::data_migrations::entities_status
+parse_migrated_entities_status(json::Value& json) {
+    cluster::data_migrations::entities_status ret;
+
+    if (auto it = json.FindMember(consumer_groups_data_key);
+        it != json.MemberEnd()) {
+        auto consumer_groups_array = it->value.GetArray();
+        ret.groups.reserve(consumer_groups_array.Size());
+        for (auto& group : consumer_groups_array) {
+            cluster::group_offsets group_res{
+              .group_id = group[group_id_key].GetString()};
+            for (auto& topic : group[topics_key].GetArray()) {
+                cluster::group_offsets::topic_partitions topic_res;
+                topic_res.topic = model::topic(topic[topic_key].GetString());
+                for (auto& partition : topic[partitions_key].GetArray()) {
+                    topic_res.partitions.push_back(
+                      {model::partition_id{partition[partition_key].GetInt()},
+                       kafka::offset{partition[offset_key].GetInt64()}});
+                }
+                group_res.offsets.push_back(std::move(topic_res));
+            }
+            ret.groups.emplace_back(std::move(group_res));
+        }
+    }
+    return ret;
+}
+
+ss::future<std::unique_ptr<ss::http::reply>>
+admin_server::set_migrated_entities_status(
+  std::unique_ptr<ss::http::request> req,
+  std::unique_ptr<ss::http::reply> reply) {
+    auto id = parse_data_migration_id(*req);
+
+    auto& ifrontend = _controller->get_data_migration_irpc_frontend();
+    auto json_doc = co_await parse_json_body(req.get());
+    auto status_data = parse_migrated_entities_status(json_doc);
+
+    auto res = co_await ifrontend.local().set_entities_status(
+      id, std::move(status_data));
+
+    if (res != cluster::errc::success) {
+        vlog(adminlog.warn, "unable to set migration entities status: {}", res);
+        co_await throw_on_error(*req, res, model::controller_ntp);
+    }
+    reply->set_status(ss::http::reply::status_type::ok);
+    co_return std::move(reply);
 }

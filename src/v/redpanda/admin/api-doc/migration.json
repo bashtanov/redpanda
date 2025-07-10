@@ -123,6 +123,51 @@
         ]
     }
 },
+"/v1/migrations/{id}/entities_status": {
+    "get": {
+        "summary": "Get topics statuses and consumer groups data for an outbound migration",
+        "operationId": "get_migrated_entities_status",
+        "parameters": [
+            {
+                "name": "id",
+                "in": "path",
+                "required": true,
+                "type": "int"
+            }
+        ],
+        "responses": {
+            "200": {
+                "description": "OK",
+                "schema": {
+                    "$ref": "migrated_entities_status"
+                }
+            }
+        }
+    },
+    "put": {
+        "summary": "Update an inbound migration with outbound topics statuses and consumer groups data",
+        "operationId": "set_migrated_entities_status",
+        "parameters": [
+            {
+                "name": "id",
+                "in": "path",
+                "required": true,
+                "type": "int"
+            }
+        ],
+        "requestBody": {
+            "description": "Topics statuses and consumer groups data",
+            "required": true,
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "$ref": "migrated_entities_status"
+                    }
+                }
+            }
+        }
+    }
+},
 "/v1/topics/mountable": {
     "get": {
         "operationId": "list_mountable_topics",
