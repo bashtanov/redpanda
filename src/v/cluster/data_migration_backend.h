@@ -56,6 +56,12 @@ public:
     ss::future<> start();
     ss::future<> stop();
 
+    ss::future<result<entities_status, errc>>
+    get_entities_status(id migration_id);
+
+    ss::future<errc>
+    set_entities_status(id migration_id, entities_status status);
+
 private:
     struct work_scope {
         std::optional<state> sought_state;
@@ -94,9 +100,11 @@ private:
       = chunked_hash_map<model::partition_id, chunked_vector<consumer_group>>;
     struct migration_reconciliation_state {
         explicit migration_reconciliation_state(work_scope scope)
-          : scope(scope) {}
+          : scope(scope)
+          , entities_ready(!scope.needs_entity_state_update) {}
         work_scope scope;
         topic_map_t outstanding_topics;
+        bool entities_ready;
         // may not stay unfilled between scheduling points
         std::optional<partition_consumer_group_map_t> partition_group_map;
     };

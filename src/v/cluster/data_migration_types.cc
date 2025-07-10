@@ -276,4 +276,15 @@ std::ostream& operator<<(std::ostream& o, const check_ntp_states_reply& r) {
     return o;
 }
 
+std::ostream& operator<<(std::ostream& o, const entities_status& es) {
+    fmt::print(
+      o,
+      "{{groups: {}}}",
+      fmt::join(
+        std::views::transform(
+          es.groups, [](const group_offsets& g) { return g.group_id; }),
+        ", "));
+    return o;
+}
+
 } // namespace cluster::data_migrations

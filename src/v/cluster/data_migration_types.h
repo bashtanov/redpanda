@@ -12,6 +12,7 @@
 
 #include "absl/container/flat_hash_set.h"
 #include "cluster/errc.h"
+#include "cluster/offsets_snapshot.h"
 #include "container/chunked_vector.h"
 #include "kafka/protocol/types.h"
 #include "model/metadata.h"
@@ -576,6 +577,12 @@ struct check_ntp_states_reply
     friend bool operator==(const self&, const self&) = default;
 
     friend std::ostream& operator<<(std::ostream&, const self&);
+};
+
+struct entities_status {
+    chunked_vector<group_offsets> groups;
+
+    friend std::ostream& operator<<(std::ostream&, const entities_status&);
 };
 
 } // namespace cluster::data_migrations

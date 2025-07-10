@@ -11,6 +11,7 @@
 #include "cluster/data_migration_irpc_frontend.h"
 
 #include "cluster/data_migration_backend.h"
+#include "cluster/data_migration_types.h"
 #include "features/feature_table.h"
 
 #include <seastar/core/shard_id.hh>
@@ -31,6 +32,18 @@ irpc_frontend::check_ntp_states(check_ntp_states_request&& req) {
 
     return _backend.invoke_on_instance(
       &backend::check_ntp_states_locally, std::move(req));
+}
+
+ss::future<result<entities_status, errc>>
+irpc_frontend::get_entities_status(id migration_id) {
+    return _backend.invoke_on_instance(
+      &backend::get_entities_status, migration_id);
+}
+
+ss::future<errc>
+irpc_frontend::set_entities_status(id migration_id, entities_status status) {
+    return _backend.invoke_on_instance(
+      &backend::set_entities_status, migration_id, std::move(status));
 }
 
 } // namespace cluster::data_migrations

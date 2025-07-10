@@ -10,6 +10,7 @@
  */
 #pragma once
 
+#include "base/outcome.h"
 #include "cluster/data_migration_types.h"
 #include "cluster/fwd.h"
 #include "features/fwd.h"
@@ -26,6 +27,12 @@ public:
 
     ss::future<check_ntp_states_reply>
     check_ntp_states(check_ntp_states_request&& req);
+
+    ss::future<result<entities_status, errc>>
+    get_entities_status(id migration_id);
+
+    ss::future<errc>
+    set_entities_status(id migration_id, entities_status status);
 
 private:
     ss::sharded<features::feature_table>& _features;
