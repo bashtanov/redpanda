@@ -20,10 +20,12 @@ service_handler::service_handler(
   ss::scheduling_group sc,
   ss::smp_service_group ssg,
   ss::sharded<frontend>& frontend,
-  ss::sharded<irpc_frontend>& irpc_frontend)
+  ss::sharded<irpc_frontend>& irpc_frontend,
+  ss::sharded<router>& router)
   : data_migrations_service(sc, ssg)
   , _frontend(frontend)
-  , _irpc_frontend(irpc_frontend) {}
+  , _irpc_frontend(irpc_frontend)
+  , _router(router) {}
 
 ss::future<create_migration_reply> service_handler::create_migration(
   create_migration_request request, ::rpc::streaming_context&) {
@@ -66,6 +68,16 @@ ss::future<check_ntp_states_reply> service_handler::check_ntp_states(
   check_ntp_states_request request, ::rpc::streaming_context&) {
     return _irpc_frontend.local().check_ntp_states(std::move(request));
 }
+
+ss::future<get_group_offsets_reply> service_handler::get_group_offsets(
+  get_group_offsets_request request, ::rpc::streaming_context&) {
+    return _router.local().get_group_offsets(std::move(request));
+};
+
+ss::future<set_group_offsets_reply> service_handler::set_group_offsets(
+  set_group_offsets_request request, ::rpc::streaming_context&) {
+    return _router.local().set_group_offsets(std::move(request));
+};
 
 cluster::errc service_handler::map_error_code(std::error_code ec) {
     if (ec.category() == cluster::error_category()) {

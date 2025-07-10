@@ -17,6 +17,7 @@
 #include "cluster/controller_probe.h"
 #include "cluster/controller_stm.h"
 #include "cluster/data_migration_group_proxy.h"
+#include "cluster/data_migration_router.h"
 #include "cluster/fwd.h"
 #include "cluster/node_status_table.h"
 #include "cluster/scheduling/leader_balancer.h"
@@ -171,6 +172,10 @@ public:
     ss::sharded<data_migrations::irpc_frontend>&
     get_data_migration_irpc_frontend() {
         return _data_migration_irpc_frontend;
+    }
+
+    ss::sharded<data_migrations::router>& get_data_migration_router() {
+        return _data_migration_router;
     }
 
     std::optional<std::reference_wrapper<cloud_metadata::uploader>>
@@ -360,6 +365,7 @@ private:
     ss::sharded<client_quota::frontend> _quota_frontend; // instance per core
     ss::sharded<client_quota::store> _quota_store;       // instance per core
     ss::sharded<client_quota::backend> _quota_backend;   // single instance
+    ss::sharded<data_migrations::router> _data_migration_router;
     ss::sharded<data_migrations::worker> _data_migration_worker;
     ss::sharded<cloud_storage::topic_mount_handler> _topic_mount_handler;
     ssx::single_sharded<data_migrations::backend> _data_migration_backend;

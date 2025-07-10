@@ -3397,7 +3397,8 @@ void application::start_runtime_services(
               sched_groups.cluster_sg(),
               smp_service_groups.cluster_smp_sg(),
               std::ref(controller->get_data_migration_frontend()),
-              std::ref(controller->get_data_migration_irpc_frontend())));
+              std::ref(controller->get_data_migration_irpc_frontend()),
+              std::ref(controller->get_data_migration_router())));
           if (datalake_enabled()) {
               runtime_services.push_back(
                 std::make_unique<datalake::coordinator::rpc::service>(

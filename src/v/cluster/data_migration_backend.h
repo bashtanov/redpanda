@@ -12,6 +12,7 @@
 #include "cloud_storage/fwd.h"
 #include "cloud_storage/topic_mount_handler.h"
 #include "cluster/data_migration_group_proxy.h"
+#include "cluster/data_migration_router.h"
 #include "cluster/data_migration_table.h"
 #include "cluster/shard_table.h"
 #include "cluster/types.h"
@@ -39,6 +40,7 @@ public:
     backend(
       migrations_table& table,
       frontend& frontend,
+      router& router,
       ss::sharded<worker>& worker,
       partition_leaders_table& leaders_table,
       topics_frontend& topics_frontend,
@@ -364,6 +366,7 @@ private:
     migrations_table& _table;
     frontend& _frontend;
     ss::sharded<worker>& _worker;
+    router& _router;
     partition_leaders_table& _leaders_table;
     topics_frontend& _topics_frontend;
     topic_table& _topic_table;
