@@ -1912,6 +1912,24 @@ class Admin:
         path = "topics/mountable"
         return self._request("GET", path, node=node)
 
+    def get_migrated_entities_status(
+        self,
+        migration_id: int,
+        node: Optional[ClusterNode] = None,
+    ):
+        path = f"migrations/{migration_id}/entities_status"
+        return self._request(
+            "GET",
+            path,
+            node=node,
+        )
+
+    def put_migrated_entities_status(
+        self, migration_id: int, data: dict, node: Optional[ClusterNode] = None
+    ):
+        path = f"migrations/{migration_id}/entities_status"
+        return self._request("PUT", path, node=node, json=data)
+
     def unmount_topics(
         self, topics: list[NamespacedTopic], node: Optional[ClusterNode] = None
     ):
