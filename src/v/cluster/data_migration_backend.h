@@ -78,8 +78,9 @@ private:
         size_t idx_in_migration;
         chunked_hash_map<model::partition_id, std::vector<model::node_id>>
           outstanding_partitions; // for partition scoped ops
-        bool topic_scoped_work_needed;
-        bool topic_scoped_work_done;
+        bool topic_scoped_work_needed = false;
+        bool topic_scoped_work_done = false;
+        bool approved_to_start = true;
         void clear();
     };
     using topic_map_t = chunked_hash_map<
