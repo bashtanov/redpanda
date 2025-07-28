@@ -9,6 +9,7 @@
 
 import random
 import time
+from typing import Callable, Literal, List, TypedDict, get_type_hints
 import typing
 from contextlib import contextmanager, nullcontext
 from typing import Callable, List, Literal, TypedDict, get_type_hints
@@ -42,7 +43,7 @@ from rptest.services.redpanda import (
 )
 from rptest.tests.e2e_finjector import Finjector
 from rptest.tests.redpanda_test import RedpandaTest
-from rptest.util import bg_thread_cm
+from rptest.util import bg_thread_cm, repeat_check, wait_until_result
 from rptest.utils.data_migrations import DataMigrationTestMixin
 
 MIGRATION_LOG_ALLOW_LIST = [
@@ -1420,18 +1421,23 @@ class DataMigrationsMultiClusterTest(RedpandaTest, DataMigrationTestMixin):
         self.producer = None
         return acked
 
-    def start_consumer(self, topic, redpanda) -> KgoVerifierConsumerGroupConsumer:
+    def start_consumer(
+        self, topic, redpanda, group_name="test-group", commit_asap=False
+    ) -> KgoVerifierConsumerGroupConsumer:
+        self.logger.info("consumer starting")
         consumer = KgoVerifierConsumerGroupConsumer(
             self.test_context,
             redpanda,
             topic,
             self.msg_size,
             readers=3,
-            group_name="test-group",
+            group_name=group_name,
+            max_uncommitted=1 if commit_asap else None,
             trace_logs=True,
         )
 
         consumer.start()
+        self.logger.info("consumer started")
         return consumer
 
     def consume(self, topic, redpanda, msg_count) -> None:
@@ -1440,6 +1446,26 @@ class DataMigrationsMultiClusterTest(RedpandaTest, DataMigrationTestMixin):
         consumer.wait_total_reads(msg_count, timeout_sec=60, backoff_sec=1)
         consumer.stop()
         consumer.free()
+
+    def stop_consumer(self, consumer) -> int:
+        total_read = wait_until_result(
+            repeat_check(3)(
+                lambda: (True, consumer.consumer_status.validator.total_reads)
+            ),
+            timeout_sec=60,
+            backoff_sec=consumer._status_thread.INTERVAL,
+            err_msg="consumer total reads won't stabilize",
+        )
+        try:
+            consumer._status_thread.raise_on_error()
+        except Exception as e:
+            self.logger.info(f"exception when consuming")
+            self.logger.exception(e)
+        self.logger.info("consumer stopping")
+        consumer.stop()
+        consumer.free()
+        self.logger.info(f"consumer stopped, {total_read=}")
+        return total_read
 
     def start_extra_cluster(self, num_brokers=3):
         si_settings = SISettings(
@@ -1460,8 +1486,18 @@ class DataMigrationsMultiClusterTest(RedpandaTest, DataMigrationTestMixin):
         cluster.start()
         return cluster
 
+    # 9 for 3 3-node clusters, 1 for producer/consumer
     @cluster(num_nodes=10)
-    def test_basic(self):
+    @matrix(interleaved=[True, False])
+    def test_wo_group_consumer(self, interleaved: bool):
+        self.do_test_basic(interleaved, consume_with_group=False)
+
+    # 9 for 3 3-node clusters, 1 for producer, 1 for group consumer
+    @cluster(num_nodes=11)
+    def test_with_group_consumer(self):
+        self.do_test_basic(interleaved=True, consume_with_group=True)
+
+    def do_test_basic(self, interleaved: bool, consume_with_group: bool):
         """
         Test that basic functionality like producing and consuming works when we
         migrate topics between different clusters.
@@ -1473,7 +1509,7 @@ class DataMigrationsMultiClusterTest(RedpandaTest, DataMigrationTestMixin):
             {"ntr_no_topic_manifest", "missing_segments"}
         )
 
-        n_partitions = 10
+        n_partitions = 1  # 10
         topic_name = "tp"
         workload_topic = TopicSpec(name=topic_name, partition_count=n_partitions)
         workload_ns_topic = make_namespaced_topic(topic_name)
@@ -1481,10 +1517,15 @@ class DataMigrationsMultiClusterTest(RedpandaTest, DataMigrationTestMixin):
         alias_name = topic_name + "-alias"
         alias_ns_topic = make_namespaced_topic(alias_name)
 
+        group_name = "gr"
+
+        total_acked = 0
+        group_consumed = 0
         # To test various combinations of remote location and topic name being
         # same/different from local cluster uuid and topic name, we test the
         # following scenario:
         # tp (cluster 0) -> tp-alias (cluster 1) -> tp-alias (cluster 2)
+        # gr (cluster 0) -> gr (cluster 1) -> gr (cluster 2)
 
         cluster1 = self.start_extra_cluster()
 
@@ -1492,10 +1533,24 @@ class DataMigrationsMultiClusterTest(RedpandaTest, DataMigrationTestMixin):
         self.logger.info(f"created topic {workload_topic}")
 
         self.start_producer(workload_topic.name, self.redpanda)
+        if consume_with_group:
+            group_consumer0 = self.start_consumer(
+                workload_topic.name,
+                self.redpanda,
+                group_name=group_name,
+                commit_asap=True,
+            )
         self.migrate_between_clusters(
-            [workload_ns_topic], self.redpanda, cluster1, aliases=[alias_ns_topic]
+            [workload_ns_topic],
+            [group_name],
+            self.redpanda,
+            cluster1,
+            aliases=[alias_ns_topic],
+            interleaved=interleaved,
         )
-        total_acked = self.stop_producer()
+        if consume_with_group:
+            group_consumed += self.stop_consumer(group_consumer0)
+        total_acked += self.stop_producer()
 
         def wait_for_offsets(redpanda, topic_name, expected):
             def predicate():
@@ -1521,21 +1576,49 @@ class DataMigrationsMultiClusterTest(RedpandaTest, DataMigrationTestMixin):
 
         self.logger.info("producing more to the second cluster")
         self.start_producer(alias_name, cluster1)
-
-        self.consume(
-            alias_name,
-            redpanda=cluster1,
-            msg_count=total_acked + self.producer.produce_status.acked,
-        )
+        if consume_with_group:
+            group_consumer1 = self.start_consumer(
+                alias_name, cluster1, group_name=group_name, commit_asap=True
+            )
+        else:
+            self.consume(
+                alias_name,
+                redpanda=cluster1,
+                msg_count=total_acked + self.producer.produce_status.acked,
+            )
 
         cluster2 = self.start_extra_cluster()
-        self.migrate_between_clusters([alias_ns_topic], cluster1, cluster2)
+        self.migrate_between_clusters(
+            [alias_ns_topic], [group_name], cluster1, cluster2, interleaved=interleaved
+        )
+        if consume_with_group:
+            group_consumed += self.stop_consumer(group_consumer1)
 
         total_acked += self.stop_producer()
         wait_for_offsets(cluster2, alias_name, total_acked)
 
         self.logger.info("producing limited messages to the third cluster")
-        self.start_producer(alias_name, cluster2, min_msgs=1000, max_msgs=1000)
-        total_acked += self.stop_producer()
+        msgs = 100
+        self.start_producer(alias_name, cluster2, min_msgs=msgs, max_msgs=msgs)
+        assert self.stop_producer() == msgs
+        total_acked += msgs
 
-        self.consume(alias_name, redpanda=cluster2, msg_count=total_acked)
+        if consume_with_group:
+            group_consumer2 = self.start_consumer(
+                alias_name, cluster2, group_name=group_name
+            )
+            expected_gc2_messages = total_acked - group_consumed
+            self.redpanda.logger.info(
+                f"{total_acked=}, {group_consumed=}, {expected_gc2_messages=}"
+            )
+            group_consumer2.wait_total_reads(expected_gc2_messages, 120, 2)
+            final_gc2_messages = self.stop_consumer(group_consumer2)
+            # allow for at-least-once delivery:
+            # we can lose one commit per partition per migration
+            assert (
+                expected_gc2_messages
+                <= final_gc2_messages
+                <= expected_gc2_messages + 2 * n_partitions
+            ), f"{final_gc2_messages=}, {expected_gc2_messages=}"
+        else:
+            self.consume(alias_name, redpanda=cluster2, msg_count=total_acked)

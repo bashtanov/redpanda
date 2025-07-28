@@ -23,6 +23,15 @@ from rptest.services.admin import (
     OutboundDataMigration,
 )
 from rptest.services.redpanda import RedpandaService
+from rptest.util import bg_thread_cm
+
+from typing import NamedTuple, List
+
+
+class RpAndMigration(NamedTuple):
+    redpanda: RedpandaService
+    migration_id: int
+    name: str
 
 
 def now():
@@ -238,16 +247,18 @@ class DataMigrationTestMixin:
     def migrate_between_clusters(
         self,
         topics: list[NamespacedTopic],
+        groups: list[str],
         source: RedpandaService,
         dest: RedpandaService,
         aliases: list[NamespacedTopic] | None = None,
+        interleaved: bool = False,
     ) -> None:
         assert source != dest
 
         if aliases is not None:
             assert len(aliases) == len(topics)
 
-        out_migration = OutboundDataMigration(topics=topics, consumer_groups=[])
+        out_migration = OutboundDataMigration(topics=topics, consumer_groups=groups)
 
         out_migration_id = self.create_and_wait(out_migration, redpanda=source)
         source.logger.info(f"created outbound migration, id {out_migration_id}")
@@ -268,47 +279,111 @@ class DataMigrationTestMixin:
 
             self.logger.debug(f"topic for inbound migration: {in_topics[-1].as_dict()}")
 
-        in_migration = InboundDataMigration(topics=in_topics, consumer_groups=[])
+        in_migration = InboundDataMigration(
+            topics=in_topics, consumer_groups=groups, await_communication=interleaved
+        )
         in_migration_id = self.create_and_wait(in_migration, redpanda=dest)
         dest.logger.info(f"created inbound migration, id {in_migration_id}")
 
-        source._admin.execute_data_migration_action(
-            out_migration_id, MigrationAction.prepare
+        src = RpAndMigration(
+            redpanda=source, migration_id=out_migration_id, name="source"
         )
-        self.wait_for_migration_states(out_migration_id, ["prepared"], redpanda=source)
-        self.logger.info(f"prepared on source")
+        dst = RpAndMigration(redpanda=dest, migration_id=in_migration_id, name="dest")
 
-        source._admin.execute_data_migration_action(
-            out_migration_id, MigrationAction.execute
-        )
-        self.wait_for_migration_states(out_migration_id, ["executed"], redpanda=source)
-        self.logger.info(f"executed on source")
+        def transition(rm: RpAndMigration, action: MigrationAction):
+            rm.redpanda._admin.execute_data_migration_action(rm.migration_id, action)
 
-        source._admin.execute_data_migration_action(
-            out_migration_id, MigrationAction.finish
-        )
-        self.wait_for_migration_states(out_migration_id, ["finished"], redpanda=source)
-        self.logger.info(f"finished on source")
+        def wait_for_state(rm: RpAndMigration, states: List[str]):
+            self.wait_for_migration_states(
+                rm.migration_id, states, redpanda=rm.redpanda
+            )
+            self.logger.info(f"{rm.name} on one of {states}")
 
-        # TODO: currently migrations need to be executed sequentially (on source
-        # then on destination). Ideally the implementation should allow for concurrent
-        # execution (i.e. we could start some preparations on destination while
-        # source migration is still being executed).
+        @bg_thread_cm
+        def communication_thread(
+            src: RpAndMigration, dst: RpAndMigration, topic_name_map: dict[str, str]
+        ):
+            topic_name_map = {
+                topics[i].topic: aliases[i].topic
+                for i in range(len(topics))
+                if aliases is not None
+            }
+            namespaced_topic_name_mapper = (
+                lambda nt: {
+                    "topic": topic_name_map.get(nt["topic"], nt["topic"]),
+                    "ns": "kafka",
+                }
+                if nt["ns"] == "kafka"
+                else nt
+            )
 
-        dest._admin.execute_data_migration_action(
-            in_migration_id, MigrationAction.prepare
-        )
-        self.wait_for_migration_states(in_migration_id, ["prepared"], redpanda=dest)
-        self.logger.info(f"prepared on dest")
+            while (yield):
+                try:
+                    data = src.redpanda._admin.get_migrated_entities_status(
+                        src.migration_id, True
+                    ).json()
 
-        dest._admin.execute_data_migration_action(
-            in_migration_id, MigrationAction.execute
-        )
-        self.wait_for_migration_states(in_migration_id, ["executed"], redpanda=dest)
-        self.logger.info(f"executed on dest")
+                    self.logger.info(
+                        f"communicated migrated entities status from outbound migration {src.migration_id}: {data}"
+                    )
 
-        dest._admin.execute_data_migration_action(
-            in_migration_id, MigrationAction.finish
-        )
-        self.wait_for_migration_states(in_migration_id, ["finished"], redpanda=dest)
-        self.logger.info(f"finished on dest")
+                    data["ready_topics"] = [
+                        namespaced_topic_name_mapper(t) for t in data["ready_topics"]
+                    ]
+                    for d in data.get("consumer_groups_data", []):
+                        for topic_entry in d["topics"]:
+                            topic_entry["topic"] = namespaced_topic_name_mapper(
+                                topic_entry["topic"]
+                            )
+
+                    assert (
+                        dst.redpanda._admin.put_migrated_entities_status(
+                            dst.migration_id, data
+                        ).status_code
+                        == 200
+                    )
+                    self.logger.info(
+                        f"communicated migrated entities status for inbound migration {dst.migration_id}: {data}"
+                    )
+                except Exception as e:
+                    self.logger.info(f"error communicating between clusters")
+                    self.logger.exception(e)
+                time.sleep(0.1)
+
+        if interleaved:
+            transition(src, MigrationAction.prepare)
+            wait_for_state(src, ["prepared"])
+
+            transition(dst, MigrationAction.prepare)
+            wait_for_state(dst, ["preparing", "prepared"])
+
+            with communication_thread(src, dst, {}):
+                transition(src, MigrationAction.execute)
+                wait_for_state(src, ["executed"])
+                wait_for_state(dst, ["prepared"])
+
+            transition(src, MigrationAction.finish)
+            transition(dst, MigrationAction.execute)
+            wait_for_state(src, ["finished"])
+            wait_for_state(dst, ["executed"])
+
+            transition(dst, MigrationAction.finish)
+            wait_for_state(dst, ["finished"])
+        else:
+            transition(src, MigrationAction.prepare)
+            wait_for_state(src, ["prepared"])
+
+            transition(src, MigrationAction.execute)
+            wait_for_state(src, ["executed"])
+
+            transition(src, MigrationAction.finish)
+            wait_for_state(src, ["finished"])
+
+            transition(dst, MigrationAction.prepare)
+            wait_for_state(dst, ["prepared"])
+
+            transition(dst, MigrationAction.execute)
+            wait_for_state(dst, ["executed"])
+
+            transition(dst, MigrationAction.finish)
+            wait_for_state(dst, ["finished"])
