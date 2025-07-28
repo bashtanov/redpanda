@@ -817,6 +817,13 @@ class Admin:
         r.raise_for_status()
         return r
 
+    @staticmethod
+    def _bool_param(value: bool) -> str:
+        """
+        Converts a boolean value to a string representation for use in query parameters.
+        """
+        return "true" if value else "false"
+
     def get_status_ready(self, node=None):
         return self._request("GET", "status/ready", node=node).json()
 
@@ -1313,7 +1320,7 @@ class Admin:
         params = (
             None
             if include_ephemeral is None
-            else {"include_ephemeral": f"{include_ephemeral}".lower()}
+            else {"include_ephemeral": self._bool_param(include_ephemeral)}
         )
         return self._request("get", "security/users", node=node, params=params).json()
 
@@ -1747,10 +1754,9 @@ class Admin:
         ).json()
 
     def set_storage_failure_injection(self, node, value: bool):
-        str_value = "true" if value else "false"
         return self._request(
             "PUT",
-            f"debug/set_storage_failure_injection_enabled?value={str_value}",
+            f"debug/set_storage_failure_injection_enabled?value={self._bool_param(value)}",
             node=node,
         )
 
@@ -1974,7 +1980,7 @@ class Admin:
         :simple_backtrace: If true, a one-line backtrace is logged, no tasktrace,
             if false, a full backtrace is logged including taasktrace.
         """
-        path = f"debug/log_backtrace?simple={str(simple_backtrace).lower()}"
+        path = f"debug/log_backtrace?simple={self._bool_param(simple_backtrace)}"
         return self._request("post", path, node=node)
 
     def trigger_crash(self, node: ClusterNode, crash_type: CrashType):
