@@ -333,10 +333,10 @@ ss::future<> backend::work_once() {
         _nodes_to_retry.erase(node_id);
         co_await send_rpc(node_id);
     }
-    for (const auto& nt : to_schedule_topic_work) {
-        _topic_work_to_retry.erase(nt);
-        co_await schedule_topic_work(nt);
-    }
+    co_await ssx::async_for_each(
+      to_schedule_topic_work, [this](const model::topic_namespace& nt) {
+          return schedule_topic_work(nt);
+      });
     spawn_advances();
     if (next_tick == model::timeout_clock::time_point::max()) {
         _timer.cancel();
@@ -436,22 +436,22 @@ ss::future<> backend::send_rpc(model::node_id node_id) {
       });
 }
 
-ss::future<> backend::schedule_topic_work(model::topic_namespace nt) {
+void backend::schedule_topic_work(model::topic_namespace nt) {
     auto it = _topic_migration_map.find(nt);
     if (it == _topic_migration_map.end()) {
-        co_return;
+        return;
     }
     auto migration_id = it->second;
 
     auto& mrstate = _migration_states.find(migration_id)->second;
     auto& tstate = mrstate.outstanding_topics.at(nt);
     if (!tstate.topic_scoped_work_needed || tstate.topic_scoped_work_done) {
-        co_return;
+        return;
     }
     const auto maybe_migration = _table.get_migration(migration_id);
     if (!maybe_migration) {
         vlog(dm_log.trace, "migration {} gone, ignoring", migration_id);
-        co_return;
+        return;
     }
     topic_work tw{
       .migration_id = migration_id,

@@ -164,7 +164,7 @@ private:
     void spawn_advances();
 
     /* topic work */
-    ss::future<> schedule_topic_work(model::topic_namespace nt);
+    void schedule_topic_work(model::topic_namespace nt);
     ss::future<topic_work_result>
     // also resulting future cannot throw when co_awaited
     do_topic_work(model::topic_namespace nt, topic_work tw) noexcept;
