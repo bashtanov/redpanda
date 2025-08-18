@@ -1516,8 +1516,11 @@ class DataMigrationsMultiClusterTest(RedpandaTest, DataMigrationTestMixin):
                 partitions = list(rpk.describe_topic(topic_name))
                 if len(partitions) != n_partitions:
                     return False
-                total = sum(p.high_watermark for p in partitions)
-                self.logger.info(f"topic {topic_name} offsets: {total=}, {expected=}")
+                offsets = [p.high_watermark for p in partitions]
+                total = sum(offsets)
+                self.logger.info(
+                    f"topic {topic_name} {offsets=}: {total=}, {expected=}"
+                )
                 return total == expected
 
             wait_until(
