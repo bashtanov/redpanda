@@ -96,6 +96,7 @@ to_admin_type(const cluster::data_migrations::inbound_migration& idm) {
         migration.consumer_groups.push(cg);
     }
     migration.auto_advance = idm.auto_advance;
+    migration.await_communication = idm.await_communication;
     return migration;
 }
 
@@ -192,6 +193,10 @@ json::validator make_migration_validator() {
                     "items": {
                       "type":"string"
                     }
+                },
+                "await_communication": {
+                    "description": "If set, migration will wait for individual topics readiness confirmed via `PUT /v1/migrations/{id}/entities_status` API calls before processing them in `prepared` stage",
+                    "type": "boolean"
                 }
             },
             "required": [
@@ -277,6 +282,7 @@ parse_inbound_data_migration(json::Value& json) {
     for (auto& group : consumer_groups_array) {
         ret.groups.emplace_back(group.GetString());
     }
+    ret.await_communication = json["await_communication"].GetBool();
     return ret;
 }
 

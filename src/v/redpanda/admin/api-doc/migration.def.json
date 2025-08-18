@@ -123,6 +123,10 @@
         "auto_advance": {
             "type": "boolean",
             "description": "If set, migration does not need manual actions to progress"
+        },
+        "await_communication": {
+            "type": "boolean",
+            "description": "If set, migration will wait for individual topics readiness confirmed via `PUT /v1/migrations/{id}/entities_status` API calls before processing them in `prepared` stage"
         }
     },
     "required": [
