@@ -27,6 +27,7 @@
 #include <gtest/gtest.h>
 
 #include <system_error>
+#include <variant>
 namespace cluster::data_migrations::testing_details {
 class data_migration_table_test_accessor {
 public:
@@ -281,7 +282,8 @@ TEST_F_CORO(data_migration_table_fixture, test_crud_operations) {
           .id = id_2,
           .migration = cluster::data_migrations::inbound_migration{
             .topics = create_inbound_topics({"in-t-1"}),
-            .groups = create_groups({"g-3", "g-4"})}}));
+            .groups = create_groups({"g-3", "g-4"}),
+            .await_communication = true}}));
 
     validate_group_resource_state(
       {{"g-3", data_migrations::migrated_resource_state::metadata_locked},
@@ -334,9 +336,35 @@ TEST_F_CORO(data_migration_table_fixture, test_crud_operations) {
     EXPECT_EQ(notifications.size(), 4);
     EXPECT_EQ(notifications.back(), id_2);
 
+    // check migration state
     EXPECT_EQ(
       table->get_migration(id_2)->get().state,
       cluster::data_migrations::state::preparing);
+    const auto& migration2 = std::get_if<data_migrations::outbound_migration>(
+      &table->get_migration(id_2)->get().migration);
+    EXPECT_TRUE(migration2);
+    EXPECT_TRUE(migration2->await_communication);
+
+    // update again
+    r = co_await table->apply_update(
+      create_cmd<cluster::update_data_migration_state_cmd>(
+        cluster::data_migrations::update_migration_state_cmd_data{
+          .id = id_2,
+          .requested_state = cluster::data_migrations::state::preparing,
+          .mark_communication_complete = true}));
+    EXPECT_EQ(r, cluster::errc::success);
+    EXPECT_EQ(notifications.size(), 5);
+    EXPECT_EQ(notifications.back(), id_2);
+
+    // check migration state
+    EXPECT_EQ(
+      table->get_migration(id_2)->get().state,
+      cluster::data_migrations::state::preparing);
+    const auto& migration2_cc
+      = std::get_if<data_migrations::outbound_migration>(
+        &table->get_migration(id_2)->get().migration);
+    EXPECT_TRUE(migration2_cc);
+    EXPECT_TRUE(migration2_cc->await_communication);
 }
 
 TEST_F_CORO(data_migration_table_fixture, test_migration_stm_happy_path) {
