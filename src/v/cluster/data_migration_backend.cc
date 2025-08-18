@@ -701,7 +701,7 @@ ss::future<> backend::work_once() {
     }
     co_await ssx::async_for_each(
       to_schedule_topic_work, [this](const model::topic_namespace& nt) {
-          vlog(dm_log.debug, "rescheduling topic {} work", nt);
+          vlog(dm_log.debug, "scheduling topic {} work", nt);
           return schedule_topic_work(nt);
       });
     spawn_advances();
@@ -818,9 +818,18 @@ void backend::schedule_topic_work(model::topic_namespace nt) {
         return;
     }
     auto migration_id = it->second;
-
     auto& mrstate = _migration_states.find(migration_id)->second;
     auto& tstate = mrstate.outstanding_topics.at(nt);
+    vlog(
+      dm_log.trace,
+      "maybe scheduling topic work migration_id={} nt={}, "
+      "tstate.topic_work_needed={}, tstate.topic_scoped_work_done={} "
+      "tstate.approved_to_start={}",
+      migration_id,
+      nt,
+      tstate.topic_scoped_work_needed,
+      tstate.topic_scoped_work_done,
+      tstate.approved_to_start);
     if (
       !tstate.topic_scoped_work_needed || tstate.topic_scoped_work_done
       || !tstate.approved_to_start) {
@@ -1313,6 +1322,7 @@ ss::future<> backend::handle_migration_update(id id) {
     auto new_state = new_metadata.transform(
       [](const auto& md) { return md.state; });
     vlog(dm_log.debug, "migration {} new state is {}", id, new_state);
+    vlog(dm_log.trace, "migration {} is {}", id, new_metadata);
 
     work_scope new_scope;
     if (new_metadata) {
@@ -1788,12 +1798,6 @@ backend::build_migration_reconciliation_state(
 
 ss::future<> backend::reconcile_migration(
   migration_reconciliation_state& mrstate, const migration_metadata& metadata) {
-    vlog(
-      dm_log.debug,
-      "tracking migration {} transition towards state {}",
-      metadata.id,
-      mrstate.scope.sought_state);
-
     if (!mrstate.partition_group_map) {
         mrstate.partition_group_map.emplace(
           build_migration_reconciliation_state(metadata));
@@ -1805,6 +1809,13 @@ ss::future<> backend::reconcile_migration(
           bool disapprove_start
             = migration.await_communication
               && mrstate.scope.needs_approval_if_communicated();
+          vlog(
+            dm_log.debug,
+            "tracking migration {} transition towards state {}, "
+            "disapprove_start={}",
+            migration,
+            mrstate.scope.sought_state,
+            disapprove_start);
           return ss::do_with(
             // poor man's `migration.topic_nts() | std::views::enumerate`
             std::views::transform(
@@ -1839,6 +1850,14 @@ ss::future<> backend::reconcile_topic(
         co_return;
     }
     auto& tstate = mrstate.outstanding_topics[nt];
+    vlog(
+      dm_log.trace,
+      "reconcile_topic: migration={}, nt={}, idx_in_migration={}, "
+      "disapprove_start={}",
+      migration_id,
+      nt,
+      idx_in_migration,
+      disapprove_start);
     if (disapprove_start) {
         tstate.approved_to_start = false;
     }
