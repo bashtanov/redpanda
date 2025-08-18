@@ -301,6 +301,7 @@ ss::future<> backend::work_once() {
               next_tick = std::min(deadline, next_tick);
           }
       });
+    _topic_work_to_retry.clear();
 
     // defer RPC retries and topic work
     // todo: configure timeout
@@ -335,6 +336,7 @@ ss::future<> backend::work_once() {
     }
     co_await ssx::async_for_each(
       to_schedule_topic_work, [this](const model::topic_namespace& nt) {
+          vlog(dm_log.debug, "rescheduling topic {} work", nt);
           return schedule_topic_work(nt);
       });
     spawn_advances();
@@ -473,22 +475,20 @@ backend::do_topic_work(model::topic_namespace nt, topic_work tw) noexcept {
     auto tsws = ss::make_lw_shared<topic_scoped_work_state>();
     while (true) {
         auto [it, ins] = _active_topic_work_states.try_emplace(nt);
-        it->second = tsws;
         if (ins) {
+            it->second = tsws;
             break;
         }
-        tsws->rcn().request_abort();
-        // waiting for existing work to complete and delete its entry
+        // delete existing work's entry
+        auto [_, old_tsws] = _active_topic_work_states.extract(it);
+        old_tsws->rcn().request_abort();
+        // wait for existing work to complete
+        vlog(
+          dm_log.info, "waiting for older topic work on nt={} to complete", nt);
+        auto old_ec = co_await old_tsws->future();
         vlog(
           dm_log.info,
-          "waiting for older topic work {} on nt={} to complete",
-          tw,
-          nt);
-        auto old_ec = co_await tsws->future();
-        vlog(
-          dm_log.info,
-          "older topic work {} on nt {} completed with {}",
-          tw,
+          "older topic work on nt={} completed with errc={}",
           nt,
           old_ec);
     }
@@ -497,7 +497,7 @@ backend::do_topic_work(model::topic_namespace nt, topic_work tw) noexcept {
     try {
         vlog(dm_log.debug, "doing topic work {} on nt={}", tw, nt);
         ec = co_await std::visit(
-          [this, &nt, &tw, tsws = std::move(tsws)](const auto& info) mutable {
+          [this, &nt, &tw, tsws](auto& info) mutable {
               return do_topic_work(nt, tw.sought_state, info, std::move(tsws));
           },
           tw.info);
@@ -518,9 +518,19 @@ backend::do_topic_work(model::topic_namespace nt, topic_work tw) noexcept {
     }
 
     auto it = _active_topic_work_states.find(nt);
-    vassert(it != _active_topic_work_states.end(), "tsws {} disappeared", nt);
-    it->second->set_value(ec);
-    _active_topic_work_states.erase(it);
+    if (it == _active_topic_work_states.end()) {
+        vlog(dm_log.info, "topic work state for nt {} disappeared", nt);
+    } else if (it->second != tsws) {
+        vlog(
+          dm_log.info,
+          "topic work state for nt {} was superseded by another task",
+          nt);
+    } else {
+        // only remove relevant entry
+        _active_topic_work_states.erase(it);
+    }
+    // but we have a handle to the state in any case
+    tsws->set_value(ec);
 
     co_return topic_work_result{
       .nt = std::move(nt),
@@ -613,7 +623,14 @@ ss::future<> backend::abort_all_topic_work() {
         tsws->rcn().request_abort();
     }
     while (!_active_topic_work_states.empty()) {
+        vlog(
+          dm_log.info,
+          "waiting for {} topic work states to complete",
+          _active_topic_work_states.size());
+
         co_await _active_topic_work_states.begin()->second->future();
+
+        vlog(dm_log.info, "one topic work state completed");
     }
 }
 
