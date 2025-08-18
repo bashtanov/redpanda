@@ -354,17 +354,25 @@ class InboundDataMigration:
     migration_type: str
     topics: list[InboundTopic]
     consumer_groups: list[str]
+    await_communication: bool
 
-    def __init__(self, topics: list[InboundTopic], consumer_groups: list[str]):
+    def __init__(
+        self,
+        topics: list[InboundTopic],
+        consumer_groups: list[str],
+        await_communication: bool = False,
+    ):
         self.migration_type = "inbound"
         self.topics = topics
         self.consumer_groups = consumer_groups
+        self.await_communication = await_communication
 
     def as_dict(self):
         return {
             "migration_type": self.migration_type,
             "topics": [t.as_dict() for t in self.topics],
             "consumer_groups": self.consumer_groups,
+            "await_communication": self.await_communication,
         }
 
 
