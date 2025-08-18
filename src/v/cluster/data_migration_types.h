@@ -190,15 +190,19 @@ struct inbound_topic
  */
 struct inbound_migration
   : serde::
-      envelope<inbound_migration, serde::version<1>, serde::compat_version<0>> {
+      envelope<inbound_migration, serde::version<2>, serde::compat_version<0>> {
     chunked_vector<inbound_topic> topics;
     chunked_vector<consumer_group> groups;
     // run the migration through stages without explicit user action
     bool auto_advance = false;
+    // wait for get_migrated_entities_status API call before creating topics
+    bool await_communication = false;
 
     inbound_migration copy() const;
 
-    auto serde_fields() { return std::tie(topics, groups, auto_advance); }
+    auto serde_fields() {
+        return std::tie(topics, groups, auto_advance, await_communication);
+    }
 
     friend bool operator==(const inbound_migration&, const inbound_migration&)
       = default;
@@ -273,6 +277,9 @@ struct outbound_migration
     bool auto_advance = false;
     // Topic locations. If not empty, must have the same size as topics.
     chunked_vector<topic_location> topic_locations;
+
+    // outbound migration does not await communication updates
+    constexpr static bool await_communication = false;
 
     outbound_migration copy() const;
 
@@ -422,13 +429,17 @@ struct create_migration_cmd_data
 struct update_migration_state_cmd_data
   : serde::envelope<
       update_migration_state_cmd_data,
-      serde::version<1>,
+      serde::version<2>,
       serde::compat_version<0>> {
     id id;
     state requested_state;
     model::timestamp op_timestamp{};
+    bool mark_communication_complete = false;
 
-    auto serde_fields() { return std::tie(id, requested_state, op_timestamp); }
+    auto serde_fields() {
+        return std::tie(
+          id, requested_state, op_timestamp, mark_communication_complete);
+    }
     friend bool operator==(
       const update_migration_state_cmd_data&,
       const update_migration_state_cmd_data&)
@@ -486,11 +497,14 @@ struct create_migration_reply
 struct update_migration_state_request
   : serde::envelope<
       update_migration_state_request,
-      serde::version<0>,
+      serde::version<1>,
       serde::compat_version<0>> {
     id id;
     state state;
-    auto serde_fields() { return std::tie(id, state); }
+    bool mark_communication_complete = false;
+    auto serde_fields() {
+        return std::tie(id, state, mark_communication_complete);
+    }
     friend bool operator==(
       const update_migration_state_request&,
       const update_migration_state_request&)

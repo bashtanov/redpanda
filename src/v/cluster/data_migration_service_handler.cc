@@ -49,7 +49,10 @@ service_handler::update_migration_state(
   update_migration_state_request request, ::rpc::streaming_context&) {
     return _frontend.local()
       .update_migration_state(
-        request.id, request.state, frontend::can_dispatch_to_leader::no)
+        request.id,
+        request.state,
+        request.mark_communication_complete,
+        frontend::can_dispatch_to_leader::no)
       .then([](std::error_code ec) {
           return update_migration_state_reply{.ec = map_error_code(ec)};
       });

@@ -164,15 +164,26 @@ ss::future<result<id>> frontend::create_migration(
 }
 
 ss::future<std::error_code> frontend::update_migration_state(
-  id id, state state, can_dispatch_to_leader can_dispatch) {
+  id id,
+  state state,
+  bool mark_communication_complete,
+  can_dispatch_to_leader can_dispatch) {
     if (!data_migrations_active(false)) {
         return ssx::now<std::error_code>(errc::feature_disabled);
     }
+    vassert(
+      _features.is_active(features::feature::migration_topic_wise_approval)
+        || !mark_communication_complete,
+      "feature {} must be enabled to mark communication complete",
+      features::feature::migration_topic_wise_approval);
     vlog(dm_log.debug, "updating migration: {} state with: {}", id, state);
     return process_or_dispatch<
       update_migration_state_request,
       update_migration_state_reply>(
-      update_migration_state_request{.id = id, .state = state},
+      update_migration_state_request{
+        .id = id,
+        .state = state,
+        .mark_communication_complete = mark_communication_complete},
       can_dispatch,
       [timeout = _operation_timeout](
         update_migration_state_request req,
@@ -183,7 +194,8 @@ ss::future<std::error_code> frontend::update_migration_state(
       [this](update_migration_state_request req) {
           return container().invoke_on(
             data_migrations_shard, [req](frontend& local) mutable {
-                return local.do_update_migration_state(req.id, req.state);
+                return local.do_update_migration_state(
+                  req.id, req.state, req.mark_communication_complete);
             });
       },
       [](result<update_migration_state_reply> reply) -> std::error_code {
@@ -292,6 +304,20 @@ ss::future<result<id>> frontend::do_create_migration(data_migration migration) {
         co_return v_err->ec();
     }
 
+    if (auto in = std::get_if<inbound_migration>(&migration)) {
+        if (
+          in->await_communication
+          && !_features.is_active(
+            features::feature::migration_topic_wise_approval)) {
+            vlog(
+              dm_log.warn,
+              "data migration {} requires topic-wise approval, but feature "
+              "is not active",
+              migration);
+            co_return errc::feature_disabled;
+        }
+    }
+
     auto id = _table.local().get_next_id();
     ec = co_await replicate_and_wait(
       _controller,
@@ -364,8 +390,8 @@ ss::future<std::error_code> frontend::insert_barrier() {
     co_return errc::success;
 }
 
-ss::future<std::error_code>
-frontend::do_update_migration_state(id id, state state) {
+ss::future<std::error_code> frontend::do_update_migration_state(
+  id id, state state, bool mark_communication_complete) {
     validate_migration_shard();
     auto ec = co_await insert_barrier();
     if (ec) {
@@ -380,6 +406,15 @@ frontend::do_update_migration_state(id id, state state) {
         vlog(dm_log.warn, "migration {} id not found", id);
         co_return errc::data_migration_not_exists;
     }
+    auto maybe_inbound_ptr = std::get_if<inbound_migration>(
+      &migration.value().get().migration);
+    if (mark_communication_complete && !maybe_inbound_ptr) {
+        vlog(
+          dm_log.warn,
+          "cannot mark communication complete for non-inbound migration {}",
+          id);
+        co_return errc::invalid_data_migration_state;
+    }
     auto cur_state = migration.value().get().state;
     if (!migrations_table::is_valid_state_transition(cur_state, state)) {
         vlog(
@@ -390,6 +425,22 @@ frontend::do_update_migration_state(id id, state state) {
           state);
         co_return errc::invalid_data_migration_state;
     }
+    /**
+     * Shortcut if already in desired state
+     */
+    bool communication_will_change = maybe_inbound_ptr
+                                     && maybe_inbound_ptr->await_communication
+                                     && mark_communication_complete;
+    if (state == cur_state && !communication_will_change) {
+        vlog(
+          dm_log.debug,
+          "migration {} already in state {} and no change to communication "
+          "flag requested, nothing to do",
+          id,
+          state);
+        co_return errc::success;
+    }
+
     ec = co_await replicate_and_wait(
       _controller,
       _as,
@@ -398,7 +449,8 @@ frontend::do_update_migration_state(id id, state state) {
         update_migration_state_cmd_data{
           .id = id,
           .requested_state = state,
-          .op_timestamp = model::timestamp::now()}),
+          .op_timestamp = model::timestamp::now(),
+          .mark_communication_complete = mark_communication_complete}),
       _operation_timeout + model::timeout_clock::now());
 
     if (ec) {

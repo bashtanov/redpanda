@@ -23,6 +23,7 @@
 
 #include <optional>
 #include <ranges>
+#include <variant>
 
 fmt::appender
 fmt::formatter<cluster::data_migrations::migrations_table::validation_error>::
@@ -55,6 +56,9 @@ migrations_table::migrations_table(
 ss::future<> migrations_table::stop() { return ss::now(); }
 
 bool migrations_table::is_valid_state_transition(state current, state target) {
+    if (current == target) {
+        return true;
+    }
     switch (current) {
     case state::planned:
         return target == state::preparing;
@@ -384,7 +388,21 @@ migrations_table::apply(update_data_migration_state_cmd cmd) {
       || requested_state == state::cancelled) {
         it->second.completed_timestamp = cmd.value.op_timestamp;
     }
-    // notify callbacks after resources, see comment in migrations_table::apply
+
+    if (cmd.value.mark_communication_complete) {
+        ss::visit(
+          it->second.migration,
+          [](inbound_migration& m) { m.await_communication = false; },
+          [](outbound_migration&) {
+              vlog(
+                dm_log.error,
+                "communication_complete is not applicable to outbound "
+                "migrations");
+          });
+    };
+
+    // notify callbacks after resources, see comment in
+    // migrations_table::apply(create_data_migration_cmd)
     co_await _resources.invoke_on_all(
       [&meta = it->second](migrated_resources& resources) {
           resources.apply_update(meta);

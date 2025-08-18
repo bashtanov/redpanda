@@ -45,7 +45,8 @@ inbound_migration inbound_migration::copy() const {
     return inbound_migration{
       .topics = topics.copy(),
       .groups = groups.copy(),
-      .auto_advance = auto_advance};
+      .auto_advance = auto_advance,
+      .await_communication = await_communication};
 }
 
 const chunked_vector<model::topic_namespace>
@@ -143,10 +144,12 @@ std::ostream& operator<<(std::ostream& o, const topic_location& tl) {
 std::ostream& operator<<(std::ostream& o, const inbound_migration& dm) {
     fmt::print(
       o,
-      "{{topics: {}, consumer_groups: {}, auto_advance: {}}}",
+      "{{topics: {}, consumer_groups: {}, auto_advance: {}, "
+      "await_communication: {}}}",
       fmt::join(dm.topics, ", "),
       fmt::join(dm.groups, ", "),
-      dm.auto_advance);
+      dm.auto_advance,
+      dm.await_communication);
     return o;
 }
 
@@ -222,10 +225,12 @@ std::ostream&
 operator<<(std::ostream& o, const update_migration_state_cmd_data& d) {
     fmt::print(
       o,
-      "{{id: {}, requested_state: {}, op_timestamp: {}}}",
+      "{{id: {}, requested_state: {}, op_timestamp: {}, "
+      "mark_communication_complete: {}}}",
       d.id,
       d.requested_state,
-      d.op_timestamp);
+      d.op_timestamp,
+      d.mark_communication_complete);
     return o;
 }
 

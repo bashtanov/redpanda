@@ -49,7 +49,10 @@ public:
       can_dispatch_to_leader dispatch = can_dispatch_to_leader::yes);
 
     ss::future<std::error_code> update_migration_state(
-      id, state, can_dispatch_to_leader dispatch = can_dispatch_to_leader::yes);
+      id,
+      state,
+      bool mark_communication_complete = false,
+      can_dispatch_to_leader dispatch = can_dispatch_to_leader::yes);
 
     ss::future<std::error_code> remove_migration(
       id, can_dispatch_to_leader dispatch = can_dispatch_to_leader::yes);
@@ -69,7 +72,8 @@ private:
      * Must be executed on data migrations shard
      */
     ss::future<result<id>> do_create_migration(data_migration);
-    ss::future<std::error_code> do_update_migration_state(id, state);
+    ss::future<std::error_code>
+    do_update_migration_state(id, state, bool mark_communication_complete);
     ss::future<std::error_code> do_remove_migration(id);
 
     ss::future<std::error_code> insert_barrier();
