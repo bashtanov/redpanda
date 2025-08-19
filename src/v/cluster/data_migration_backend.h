@@ -78,6 +78,9 @@ private:
                      ? co_partition_work_needed
                      : data_partition_work_needed;
         };
+        bool needs_approval_if_communicated() const {
+            return sought_state == state::prepared;
+        }
     };
     struct topic_reconciliation_state {
         // will be invalid for consumer offsets topic
@@ -249,7 +252,8 @@ private:
       const id migration_id,
       size_t idx_in_migration,
       const model::topic_namespace& nt,
-      migration_reconciliation_state& mrstate);
+      migration_reconciliation_state& mrstate,
+      bool disapprove_start);
 
     // call only with _mutex lock grabbed
     ss::future<> reconcile_existing_topic(

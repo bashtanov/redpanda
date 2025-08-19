@@ -49,6 +49,7 @@
 #include <memory>
 #include <optional>
 #include <ranges>
+#include <variant>
 
 using namespace std::chrono_literals;
 
@@ -817,7 +818,9 @@ void backend::schedule_topic_work(model::topic_namespace nt) {
 
     auto& mrstate = _migration_states.find(migration_id)->second;
     auto& tstate = mrstate.outstanding_topics.at(nt);
-    if (!tstate.topic_scoped_work_needed || tstate.topic_scoped_work_done) {
+    if (
+      !tstate.topic_scoped_work_needed || tstate.topic_scoped_work_done
+      || !tstate.approved_to_start) {
         return;
     }
     const auto maybe_migration = _table.get_migration(migration_id);
@@ -1300,10 +1303,9 @@ ss::future<> backend::handle_migration_update(id id) {
 
     std::optional<partition_consumer_group_map_t> group_map;
 
-    // forget about the migration if it went forward or is gone
     auto old_it = _migration_states.find(id);
-    if (old_it != _migration_states.cend()) {
-        const migration_reconciliation_state& old_mrstate = old_it->second;
+    if (old_it != _migration_states.end()) {
+        migration_reconciliation_state& old_mrstate = old_it->second;
         vlog(
           dm_log.debug,
           "migration {} old sought state is {}",
@@ -1315,6 +1317,26 @@ ss::future<> backend::handle_migration_update(id id) {
           "migration state went from seeking {} back seeking to seeking {}",
           old_mrstate.scope.sought_state,
           new_state);
+        if (
+          new_scope.sought_state
+          && new_scope.sought_state == old_mrstate.scope.sought_state) {
+            vlog(
+              dm_log.warn,
+              "migration {} state remains the same, only need to apply "
+              "communication updates",
+              id,
+              new_scope.sought_state);
+            if (std::visit(
+                  [](auto& m) { return !m.await_communication; },
+                  new_metadata->migration)) {
+                co_await ssx::async_for_each(
+                  old_mrstate.outstanding_topics, [this](auto& topic_entry) {
+                      approve_and_schedule_topic_work(topic_entry);
+                  });
+            }
+            co_return;
+        }
+        // forget about the migration if it went forward or is gone
         vlog(dm_log.debug, "dropping migration {} reconciliation state", id);
         group_map.emplace(std::move(*old_it->second.partition_group_map));
         co_await drop_migration_reconciliation_rstate(old_it);
@@ -1762,6 +1784,9 @@ ss::future<> backend::reconcile_migration(
     co_await std::visit(
       [this, migration_id = metadata.id, &mrstate](
         const auto& migration) mutable {
+          bool disapprove_start
+            = migration.await_communication
+              && mrstate.scope.needs_approval_if_communicated();
           return ss::do_with(
             // poor man's `migration.topic_nts() | std::views::enumerate`
             std::views::transform(
@@ -1769,12 +1794,15 @@ ss::future<> backend::reconcile_migration(
               [index = -1](const auto& nt) mutable {
                   return std::forward_as_tuple(++index, nt);
               }),
-            [this, migration_id, &mrstate](auto& enumerated_nts) {
+            [this, migration_id, &mrstate, disapprove_start](
+              auto& enumerated_nts) {
                 return ss::do_for_each(
                   enumerated_nts,
-                  [this, migration_id, &mrstate](const auto& idx_nt) {
+                  [this, migration_id, &mrstate, disapprove_start](
+                    const auto& idx_nt) {
                       auto& [idx, nt] = idx_nt;
-                      return reconcile_topic(migration_id, idx, nt, mrstate);
+                      return reconcile_topic(
+                        migration_id, idx, nt, mrstate, disapprove_start);
                   });
             });
       },
@@ -1785,13 +1813,17 @@ ss::future<> backend::reconcile_topic(
   const id migration_id,
   size_t idx_in_migration,
   const model::topic_namespace& nt,
-  migration_reconciliation_state& mrstate) {
+  migration_reconciliation_state& mrstate,
+  bool disapprove_start) {
     if (
       !mrstate.scope.topic_work_needed
       && !mrstate.scope.partition_work_needed(nt)) {
         co_return;
     }
     auto& tstate = mrstate.outstanding_topics[nt];
+    if (disapprove_start) {
+        tstate.approved_to_start = false;
+    }
     tstate.idx_in_migration = idx_in_migration;
     _topic_migration_map.emplace(nt, migration_id);
     co_return co_await reconcile_existing_topic(
