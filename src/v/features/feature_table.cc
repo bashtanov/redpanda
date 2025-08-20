@@ -38,6 +38,8 @@ std::string_view to_string_view(feature f) {
     switch (f) {
     case feature::iceberg_schema_merging:
         return "iceberg_schema_merging";
+    case feature::migration_topic_wise_approval:
+        return "migration_topic_wise_approval";
     case feature::consumer_groups_migrations:
         return "consumer_groups_migrations";
     case feature::cloud_retention:

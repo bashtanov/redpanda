@@ -44,6 +44,7 @@ enum class feature : std::uint64_t {
     topic_locations_in_outbound_migrations = 1ULL << 2U,
     schema_registry_authz = 1ULL << 3U,
     topic_ids_api = 1ULL << 4U,
+    migration_topic_wise_approval = 1ULL << 6U,
     consumer_groups_migrations = 1ULL << 7U,
     cloud_retention = 1ULL << 11U,
     node_isolation = 1ULL << 19U,
@@ -490,7 +491,12 @@ inline constexpr std::array feature_schema{
     feature::topic_ids_api,
     feature_spec::available_policy::always,
     feature_spec::prepare_policy::always},
-};
+  feature_spec{
+    release_version::v25_3_1,
+    "migration_topic_wise_approval",
+    feature::migration_topic_wise_approval,
+    feature_spec::available_policy::always,
+    feature_spec::prepare_policy::always}};
 
 std::string_view to_string_view(feature);
 std::string_view to_string_view(feature_state::state);
