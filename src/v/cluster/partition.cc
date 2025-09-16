@@ -537,9 +537,14 @@ ss::future<> partition::start(
 
     _archiver_flush_subscription = register_flush_hook(
       [this](
-        model::offset,
+        model::offset o,
         model::timeout_clock::time_point,
         std::optional<std::reference_wrapper<ss::abort_source>>) {
+          vlog(
+            clusterlog.trace,
+            "Invoking archiver flush hook for partition {}, offset={}",
+            this->ntp(),
+            o);
           return flush_archiver();
       });
 }
