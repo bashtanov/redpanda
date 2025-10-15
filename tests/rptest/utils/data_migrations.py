@@ -60,7 +60,7 @@ class DataMigrationTestMixin(RedpandaTest):
             lambda: all(topic_has_all_partitions(t) for t in topics),
             timeout_sec=90,
             backoff_sec=1,
-            err_msg=err_msg,
+            err_msg=err_msg(),
         )
 
     def wait_partitions_disappear(
