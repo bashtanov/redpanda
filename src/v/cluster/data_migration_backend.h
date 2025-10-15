@@ -62,6 +62,9 @@ private:
         bool data_partition_work_needed = false;
         bool co_partition_work_needed = false;
         bool topic_work_needed = false;
+        // true if the work requires entity state to be updated before
+        // proceeding to the next step
+        bool needs_entity_state_update = false;
 
         bool any_partition_work_needed() const {
             return data_partition_work_needed || co_partition_work_needed;

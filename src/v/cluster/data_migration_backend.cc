@@ -1682,31 +1682,36 @@ backend::work_scope backend::get_work_scope(
           .sought_state = state::prepared,
           .data_partition_work_needed = false,
           .co_partition_work_needed = false,
-          .topic_work_needed = true};
+          .topic_work_needed = true,
+          .needs_entity_state_update = true};
     case state::executing:
         return {
           .sought_state = state::executed,
           .data_partition_work_needed = false,
           .co_partition_work_needed = false,
-          .topic_work_needed = true};
+          .topic_work_needed = true,
+          .needs_entity_state_update = false};
     case state::cut_over:
         return {
           .sought_state = state::finished,
           .data_partition_work_needed = false,
           .co_partition_work_needed = false,
-          .topic_work_needed = true};
+          .topic_work_needed = true,
+          .needs_entity_state_update = false};
     case state::canceling:
         return {
           .sought_state = state::cancelled,
           .data_partition_work_needed = false,
           .co_partition_work_needed = false,
-          .topic_work_needed = true};
+          .topic_work_needed = true,
+          .needs_entity_state_update = false};
     default:
         return {
           .sought_state = {},
           .data_partition_work_needed = false,
           .co_partition_work_needed = false,
-          .topic_work_needed = false};
+          .topic_work_needed = false,
+          .needs_entity_state_update = false};
     };
 }
 
@@ -1719,31 +1724,36 @@ backend::work_scope backend::get_work_scope(
           .sought_state = state::prepared,
           .data_partition_work_needed = true,
           .co_partition_work_needed = false,
-          .topic_work_needed = false};
+          .topic_work_needed = false,
+          .needs_entity_state_update = false};
     case state::executing:
         return {
           .sought_state = state::executed,
           .data_partition_work_needed = true,
           .co_partition_work_needed = true,
-          .topic_work_needed = false};
+          .topic_work_needed = false,
+          .needs_entity_state_update = false};
     case state::cut_over:
         return {
           .sought_state = state::finished,
           .data_partition_work_needed = false,
           .co_partition_work_needed = true,
-          .topic_work_needed = true};
+          .topic_work_needed = true,
+          .needs_entity_state_update = false};
     case state::canceling:
         return {
           .sought_state = state::cancelled,
           .data_partition_work_needed = true,
           .co_partition_work_needed = true,
-          .topic_work_needed = false};
+          .topic_work_needed = false,
+          .needs_entity_state_update = false};
     default:
         return {
           .sought_state = {},
           .data_partition_work_needed = false,
           .co_partition_work_needed = false,
-          .topic_work_needed = false};
+          .topic_work_needed = false,
+          .needs_entity_state_update = false};
     };
 }
 
