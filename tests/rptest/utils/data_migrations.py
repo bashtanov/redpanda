@@ -24,7 +24,15 @@ from rptest.services.admin import (
 )
 from rptest.services.redpanda import RedpandaService
 
-from rptest.tests.redpanda_test import RedpandaTest
+from rptest.tests.redpanda_test import Any, RedpandaTest
+
+from typing import NamedTuple, List
+
+
+class RpAndMigration(NamedTuple):
+    redpanda: RedpandaService
+    migration_id: int
+    name: str
 
 
 def now():
@@ -237,19 +245,41 @@ class DataMigrationTestMixin(RedpandaTest):
         if all(state not in ("planned", "finished", "cancelled") for state in states):
             self.assure_not_deletable(id, redpanda=redpanda)
 
+    def get_entities_status(
+        self, migration_id, redpanda: RedpandaService | None = None
+    ):
+        if redpanda is None:
+            redpanda = self.redpanda
+
+        return redpanda._admin.get_migrated_entities_status(migration_id).json()
+
+    def set_entities_status(
+        self,
+        migration_id: int,
+        state_data: dict[str, Any],
+        redpanda: RedpandaService | None = None,
+    ):
+        if redpanda is None:
+            redpanda = self.redpanda
+
+        redpanda._admin.put_migrated_entities_status(migration_id, state_data)
+
     def migrate_between_clusters(
         self,
         topics: list[NamespacedTopic],
+        groups: list[str],
         source: RedpandaService,
         dest: RedpandaService,
         aliases: list[NamespacedTopic] | None = None,
     ) -> None:
         assert source != dest
-
+        self.logger.info(
+            f"starting migration from {source.brokers()} to {dest.brokers()}"
+        )
         if aliases is not None:
             assert len(aliases) == len(topics)
 
-        out_migration = OutboundDataMigration(topics=topics, consumer_groups=[])
+        out_migration = OutboundDataMigration(topics=topics, consumer_groups=groups)
 
         out_migration_id = self.create_and_wait(out_migration, redpanda=source)
         source.logger.info(f"created outbound migration, id {out_migration_id}")
@@ -270,47 +300,84 @@ class DataMigrationTestMixin(RedpandaTest):
 
             self.logger.debug(f"topic for inbound migration: {in_topics[-1].as_dict()}")
 
-        in_migration = InboundDataMigration(topics=in_topics, consumer_groups=[])
+        in_migration = InboundDataMigration(topics=in_topics, consumer_groups=groups)
         in_migration_id = self.create_and_wait(in_migration, redpanda=dest)
         dest.logger.info(f"created inbound migration, id {in_migration_id}")
 
-        source._admin.execute_data_migration_action(
-            out_migration_id, MigrationAction.prepare
+        src = RpAndMigration(
+            redpanda=source, migration_id=out_migration_id, name="source"
         )
-        self.wait_for_migration_states(out_migration_id, ["prepared"], redpanda=source)
-        self.logger.info(f"prepared on source")
+        dst = RpAndMigration(redpanda=dest, migration_id=in_migration_id, name="dest")
 
-        source._admin.execute_data_migration_action(
-            out_migration_id, MigrationAction.execute
-        )
-        self.wait_for_migration_states(out_migration_id, ["executed"], redpanda=source)
-        self.logger.info(f"executed on source")
+        def transition(rm: RpAndMigration, action: MigrationAction):
+            self.logger.info(
+                f"transitioning migration {rm.migration_id} on {rm.name} to {action}"
+            )
+            rm.redpanda._admin.execute_data_migration_action(rm.migration_id, action)
 
-        source._admin.execute_data_migration_action(
-            out_migration_id, MigrationAction.finish
-        )
-        self.wait_for_migration_states(out_migration_id, ["finished"], redpanda=source)
-        self.logger.info(f"finished on source")
+        def wait_for_state(rm: RpAndMigration, states: List[str]):
+            self.wait_for_migration_states(
+                rm.migration_id, states, redpanda=rm.redpanda
+            )
+            self.logger.info(f"{rm.name} on one of {states}")
 
-        # TODO: currently migrations need to be executed sequentially (on source
-        # then on destination). Ideally the implementation should allow for concurrent
-        # execution (i.e. we could start some preparations on destination while
-        # source migration is still being executed).
+        # Required migration flow is as follows:
+        #  1. source:  planned -> prepare -> execute
+        #     dest: planned -> prepare
+        #  2. Repeat until success:
+        #    a) query for consumer group state
+        #    b) set consumer group state on destination
 
-        dest._admin.execute_data_migration_action(
-            in_migration_id, MigrationAction.prepare
-        )
-        self.wait_for_migration_states(in_migration_id, ["prepared"], redpanda=dest)
-        self.logger.info(f"prepared on dest")
+        # outbound migration -> executed
+        transition(src, MigrationAction.prepare)
+        wait_for_state(src, ["prepared"])
 
-        dest._admin.execute_data_migration_action(
-            in_migration_id, MigrationAction.execute
-        )
-        self.wait_for_migration_states(in_migration_id, ["executed"], redpanda=dest)
-        self.logger.info(f"executed on dest")
+        transition(src, MigrationAction.execute)
+        wait_for_state(src, ["executed"])
 
-        dest._admin.execute_data_migration_action(
-            in_migration_id, MigrationAction.finish
-        )
-        self.wait_for_migration_states(in_migration_id, ["finished"], redpanda=dest)
-        self.logger.info(f"finished on dest")
+        # start preparing inbound migration
+        transition(dst, MigrationAction.prepare)
+        wait_for_state(dst, ["prepared"])
+        transition(dst, MigrationAction.execute)
+
+        def consumer_group_state_migrated() -> bool:
+            source_data = self.get_entities_status(src.migration_id, redpanda=source)
+
+            self.logger.debug(
+                f"retrieved consumer group data for migration: {src.migration_id} - {source_data}"
+            )
+            if aliases is not None:
+                for topic, alias in zip(topics, aliases):
+                    cg_data = source_data["consumer_groups_data"]
+                    for cg in cg_data:
+                        for topic_data in cg["topics"]:
+                            if topic_data["topic"] == topic.topic:
+                                topic_data["topic"] = alias.topic
+                                self.logger.info(
+                                    f"renaming topic {topic.topic} to {alias.topic} in consumer group {cg['group_id']}"
+                                )
+            self.logger.info(
+                f"setting consumer group status for {dst.migration_id} on destination with data: {source_data}"
+            )
+            self.set_entities_status(
+                dst.migration_id, source_data, redpanda=dst.redpanda
+            )
+            return True
+
+        if len(groups) > 0:
+            wait_until(
+                consumer_group_state_migrated,
+                timeout_sec=90,
+                backoff_sec=2,
+                err_msg="Failed to set consumer group state on destination",
+                retry_on_exc=True,
+            )
+
+        wait_for_state(dst, ["executed"])
+
+        # finish outbound migration first
+        transition(src, MigrationAction.finish)
+        wait_for_state(src, ["finished"])
+
+        transition(dst, MigrationAction.finish)
+        wait_for_state(dst, ["finished"])

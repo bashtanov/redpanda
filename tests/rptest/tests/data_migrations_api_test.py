@@ -20,7 +20,7 @@ from ducktape.mark import matrix
 from ducktape.tests.test import TestContext
 from ducktape.utils.util import wait_until
 
-from rptest.clients.rpk import RpkTool
+from rptest.clients.rpk import RpkGroup, RpkTool
 from rptest.clients.types import TopicSpec
 from rptest.services.admin import (
     Admin,
@@ -42,7 +42,7 @@ from rptest.services.redpanda import (
 )
 from rptest.tests.e2e_finjector import Finjector
 from rptest.tests.redpanda_test import RedpandaTest
-from rptest.util import bg_thread_cm
+from rptest.util import bg_thread_cm, wait_until_result
 from rptest.utils.data_migrations import DataMigrationTestMixin
 
 MIGRATION_LOG_ALLOW_LIST = [
@@ -132,7 +132,9 @@ class DataMigrationsApiTest(DataMigrationTestMixin):
             cloud_storage_enable_remote_read=True,
             cloud_storage_enable_remote_write=True,
         )
-        RedpandaTest.__init__(self, test_context=test_context, *args, **kwargs)
+        super(DataMigrationsApiTest, self).__init__(
+            test_context=test_context, *args, **kwargs
+        )
         self.flaky_admin = Admin(self.redpanda, retry_codes=[503, 504])
         self.admin = Admin(self.redpanda)
         self.last_producer_id = 0
@@ -581,22 +583,21 @@ class DataMigrationsApiTest(DataMigrationTestMixin):
             self.execute_data_migration_action_flaky(
                 in_migration_id, MigrationAction.prepare
             )
-            if try_wo_license:
-                self.wait_for_migration_states(in_migration_id, ["preparing"])
-                time.sleep(5)
-                # stuck as a topic cannot be created without license
-                self.wait_for_migration_states(in_migration_id, ["preparing"])
-                self.toggle_license(on=True)
-                self.wait_for_migration_states(in_migration_id, ["prepared"])
-                self.toggle_license(on=False)
-            else:
-                self.wait_for_migration_states(
-                    in_migration_id, ["preparing", "prepared"]
-                )
-                self.wait_for_migration_states(in_migration_id, ["prepared"])
+
+            self.wait_for_migration_states(in_migration_id, ["preparing", "prepared"])
+            self.wait_for_migration_states(in_migration_id, ["prepared"])
 
             self.execute_data_migration_action_flaky(
                 in_migration_id, MigrationAction.execute
+            )
+            self.set_entities_status_with_retries(
+                in_migration_id,
+                {
+                    "consumer_groups_data": [
+                        {"group_id": "g-1", "topics": []},
+                        {"group_id": "g-2", "topics": []},
+                    ]
+                },
             )
             self.wait_for_migration_states(in_migration_id, ["executing", "executed"])
             self.wait_for_migration_states(in_migration_id, ["executed"])
@@ -604,12 +605,21 @@ class DataMigrationsApiTest(DataMigrationTestMixin):
             self.execute_data_migration_action_flaky(
                 in_migration_id, MigrationAction.finish
             )
-            self.wait_for_migration_states(
-                in_migration_id, ["cut_over", "finished"], time_before_final_action
-            )
-            self.wait_for_migration_states(
-                in_migration_id, ["finished"], time_before_final_action
-            )
+            if try_wo_license:
+                self.wait_for_migration_states(in_migration_id, ["cut_over"])
+                time.sleep(5)
+                # stuck as a topic cannot be created without license
+                self.wait_for_migration_states(in_migration_id, ["cut_over"])
+                self.toggle_license(on=True)
+                self.wait_for_migration_states(in_migration_id, ["finished"])
+                self.toggle_license(on=False)
+            else:
+                self.wait_for_migration_states(
+                    in_migration_id, ["cut_over", "finished"], time_before_final_action
+                )
+                self.wait_for_migration_states(
+                    in_migration_id, ["finished"], time_before_final_action
+                )
 
             self.log_topics(t.name for t in topics)
 
@@ -880,7 +890,7 @@ class DataMigrationsApiTest(DataMigrationTestMixin):
                         with self.ck_consumer(group) as consumer:
                             consumer.subscribe([topic])
                             self.logger.debug("start polling consumer")
-                            msg = consumer.poll(20)
+                            msg = consumer.poll(60)
                             self.logger.debug("done polling consumer")
                             if msg is None or msg.error() is not None:
                                 raise ck.KafkaException(
@@ -1031,6 +1041,39 @@ class DataMigrationsApiTest(DataMigrationTestMixin):
 
                 self.ensure_no_inflight_transactions(workload_topic.name, 0)
 
+    def get_entities_status_with_retries(self, migration_id: int):
+        def get_entities_status():
+            try:
+                status = self.get_entities_status(migration_id)
+                return True, status
+            except Exception as e:
+                self.logger.info(
+                    f"exception when getting entities status for migration {migration_id}: {e}",
+                )
+                return False, None
+
+        return wait_until_result(
+            get_entities_status,
+            timeout_sec=60,
+            backoff_sec=2,
+            err_msg=f"Failed to get entities status for {migration_id} migration",
+        )
+
+    def set_entities_status_with_retries(
+        self, migration_id: int, expected_status: dict
+    ):
+        def set_entities_status():
+            self.set_entities_status(migration_id, expected_status)
+            return True
+
+        wait_until(
+            set_entities_status,
+            timeout_sec=60,
+            backoff_sec=2,
+            err_msg=f"Entities status for migration {migration_id} not set",
+            retry_on_exc=True,
+        )
+
     @cluster(
         num_nodes=4,
         log_allow_list=MIGRATION_LOG_ALLOW_LIST
@@ -1057,7 +1100,8 @@ class DataMigrationsApiTest(DataMigrationTestMixin):
         self.client().create_topic(workload_topic)
 
         with self.start_producer(workload_topic.name) as producer:
-            group = "consumer-group-id" if params["include_groups"] else None
+            with_consumer_groups = params["include_groups"]
+            group = "consumer-group-id" if with_consumer_groups else None
             groups = [group] if group else []
             entities = {
                 "topic": workload_topic.name,
@@ -1121,6 +1165,11 @@ class DataMigrationsApiTest(DataMigrationTestMixin):
                 )
 
                 self.wait_for_migration_states(out_migration_id, ["executed"])
+                entities_status = None
+                if with_consumer_groups:
+                    entities_status = self.get_entities_status_with_retries(
+                        out_migration_id
+                    )
                 self.validate_entities_access(
                     entities=entities,
                     expect_present=True,
@@ -1232,7 +1281,7 @@ class DataMigrationsApiTest(DataMigrationTestMixin):
 
                     self.validate_entities_access(
                         entities=entities,
-                        expect_present=True,
+                        expect_present=False,
                         expect_metadata_changeable=False,
                         expect_readable=False,
                         expect_writable=False,
@@ -1247,8 +1296,8 @@ class DataMigrationsApiTest(DataMigrationTestMixin):
                     self.logger.info(
                         f"topic list after inbound migration is prepared: {topics}"
                     )
-                    assert inbound_topic_name in topics, (
-                        "workload topic should be present after the inbound migration is prepared"
+                    assert inbound_topic_name not in topics, (
+                        "workload topic should not be present after the inbound migration is prepared"
                     )
 
                     self.admin.execute_data_migration_action(
@@ -1264,17 +1313,22 @@ class DataMigrationsApiTest(DataMigrationTestMixin):
 
                     self.validate_entities_access(
                         entities=entities,
-                        expect_present=True,
+                        expect_present=False,
                         expect_metadata_changeable=False,
                         expect_readable=False,
                         expect_writable=False,
                     )
+                    if entities_status:
+                        self.set_entities_status_with_retries(
+                            in_migration_id,
+                            entities_status,
+                        )
 
                     self.wait_for_migration_states(in_migration_id, ["executed"])
 
                     self.validate_entities_access(
                         entities=entities,
-                        expect_present=True,
+                        expect_present=False,
                         expect_metadata_changeable=False,
                         expect_readable=False,
                         expect_writable=False,
@@ -1293,6 +1347,14 @@ class DataMigrationsApiTest(DataMigrationTestMixin):
                     self.wait_for_migration_states(
                         in_migration_id, ["finished"], time_before_final_action
                     )
+                    topics = list(rpk.list_topics())
+                    self.logger.info(
+                        f"topic list after inbound migration is finished: {topics}"
+                    )
+                    assert inbound_topic_name in topics, (
+                        "workload topic should be present after the inbound migration is finished"
+                    )
+
                     self.admin.delete_data_migration(in_migration_id)
                     # now the topic should be fully operational
                     self.consume_and_validate(
@@ -1473,8 +1535,83 @@ class DataMigrationsMultiClusterTest(DataMigrationTestMixin):
         cluster.start()
         return cluster
 
+    def describe_group_state(
+        self, redpanda: RedpandaService, group_name: str
+    ) -> RpkGroup:
+        return RpkTool(redpanda).group_describe(group_name, tolerant=True)
+
+    # 9 for 3 3-node clusters, 1 for producer/consumer
     @cluster(num_nodes=10)
-    def test_basic(self):
+    def test_without_consumer_groups(self):
+        self.do_test_basic(migrate_groups=False)
+
+    # 9 for 3 3-node clusters, 1 for producer/consumer
+    @cluster(num_nodes=10)
+    def test_with_consumer_groups(self):
+        self.do_test_basic(migrate_groups=True)
+
+    def consume_with_group(self, topic, redpanda, group_name):
+        consumer = KgoVerifierConsumerGroupConsumer(
+            self.test_context,
+            redpanda,
+            topic,
+            self.msg_size,
+            readers=3,
+            group_name=group_name,
+            trace_logs=True,
+            max_msgs=1000,
+        )
+
+        consumer.start()
+        consumer.wait()
+        consumer.stop()
+        consumer.free()
+
+        return self.describe_group_state(redpanda, group_name)
+
+    def verify_group_offsets(
+        self,
+        state_before: RpkGroup,
+        state_after: RpkGroup,
+        predicate: Callable[[int, int], bool] = lambda a, b: a == b,
+        aliases: dict[str, str] | None = None,
+    ) -> bool:
+        def map_topic(topic: str) -> str:
+            if aliases and topic in aliases:
+                return aliases[topic]
+            return topic
+
+        partitions_before = {
+            (p.topic, p.partition): p.current_offset for p in state_before.partitions
+        }
+
+        partitions_after = {
+            (p.topic, p.partition): p.current_offset for p in state_after.partitions
+        }
+
+        for key, offset_before in partitions_before.items():
+            aliased_key = (map_topic(key[0]), key[1])
+            if aliased_key not in partitions_after:
+                self.logger.error(f"partition {key} missing after migration")
+                return False
+            offset_after = partitions_after.get(aliased_key)
+            if offset_before is None and offset_after is None:
+                continue
+
+            if offset_before is None or offset_after is None:
+                self.logger.error(
+                    f"partition {key} (alias: {aliased_key}) has no offsets"
+                )
+                return False
+
+            if not predicate(offset_before, offset_after):
+                self.logger.error(
+                    f"offsets do not match for {key} (alias: {aliased_key}): offset_before: {offset_before}, offset_after: {offset_after}"
+                )
+                return False
+        return True
+
+    def do_test_basic(self, migrate_groups: bool):
         """
         Test that basic functionality like producing and consuming works when we
         migrate topics between different clusters.
@@ -1486,18 +1623,23 @@ class DataMigrationsMultiClusterTest(DataMigrationTestMixin):
             {"ntr_no_topic_manifest", "missing_segments"}
         )
 
-        n_partitions = 10
-        topic_name = "tp"
+        n_partitions = 3
+        topic_name = "migrated-topic"
         workload_topic = TopicSpec(name=topic_name, partition_count=n_partitions)
         workload_ns_topic = make_namespaced_topic(topic_name)
 
         alias_name = topic_name + "-alias"
         alias_ns_topic = make_namespaced_topic(alias_name)
 
+        group_name = "migrated-group"
+
+        total_acked = 0
+
         # To test various combinations of remote location and topic name being
         # same/different from local cluster uuid and topic name, we test the
         # following scenario:
-        # tp (cluster 0) -> tp-alias (cluster 1) -> tp-alias (cluster 2)
+        # migrated-topic (cluster 0) -> migrated-topic-alias (cluster 1) -> migrated-topic-alias (cluster 2)
+        # migrated-group (cluster 0) -> migrated-group (cluster 1) -> migrated-group (cluster 2)
 
         cluster1 = self.start_extra_cluster()
 
@@ -1505,10 +1647,21 @@ class DataMigrationsMultiClusterTest(DataMigrationTestMixin):
         self.logger.info(f"created topic {workload_topic}")
 
         self.start_producer(workload_topic.name, self.redpanda)
+        if migrate_groups:
+            gr_state_before = self.consume_with_group(
+                workload_topic.name, self.redpanda, group_name
+            )
+            self.logger.info(f"group state before migration: {gr_state_before}")
+
         self.migrate_between_clusters(
-            [workload_ns_topic], self.redpanda, cluster1, aliases=[alias_ns_topic]
+            [workload_ns_topic],
+            [group_name] if migrate_groups else [],
+            self.redpanda,
+            cluster1,
+            aliases=[alias_ns_topic],
         )
-        total_acked = self.stop_producer()
+
+        total_acked += self.stop_producer()
 
         def wait_for_offsets(redpanda, topic_name, expected):
             def predicate():
@@ -1530,25 +1683,56 @@ class DataMigrationsMultiClusterTest(DataMigrationTestMixin):
                 err_msg="timed out waiting for offsets of migrated topic",
             )
 
+        if migrate_groups:
+            migrated_state = self.describe_group_state(cluster1, group_name)
+            self.logger.info(f"group state after migration: {migrated_state}")
+            assert self.verify_group_offsets(
+                gr_state_before, migrated_state, aliases={topic_name: alias_name}
+            ), "migrated group state does not match the original"
+
         wait_for_offsets(cluster1, alias_name, total_acked)
 
         self.logger.info("producing more to the second cluster")
         self.start_producer(alias_name, cluster1)
-
-        self.consume(
-            alias_name,
-            redpanda=cluster1,
-            msg_count=total_acked + self.producer.produce_status.acked,
-        )
+        if migrate_groups:
+            new_state_on_1 = self.consume_with_group(alias_name, cluster1, group_name)
+            self.logger.info(
+                f"group state after migration and consuming more messages: {new_state_on_1}"
+            )
+            assert self.verify_group_offsets(
+                migrated_state, new_state_on_1, lambda a, b: a <= b
+            ), "migrated group state did not advance after consuming more"
+        else:
+            self.consume(
+                alias_name,
+                redpanda=cluster1,
+                msg_count=total_acked + self.producer.produce_status.acked,
+            )
 
         cluster2 = self.start_extra_cluster()
-        self.migrate_between_clusters([alias_ns_topic], cluster1, cluster2)
+        self.migrate_between_clusters(
+            [alias_ns_topic],
+            [group_name] if migrate_groups else [],
+            cluster1,
+            cluster2,
+        )
 
         total_acked += self.stop_producer()
         wait_for_offsets(cluster2, alias_name, total_acked)
+        if migrate_groups:
+            migrated_state_on_2 = self.describe_group_state(cluster2, group_name)
+
+            self.logger.info(
+                f"group state after second migration: {migrated_state_on_2}"
+            )
+            assert self.verify_group_offsets(new_state_on_1, migrated_state_on_2), (
+                "migrated group state did not match the original after 2nd migration"
+            )
 
         self.logger.info("producing limited messages to the third cluster")
-        self.start_producer(alias_name, cluster2, min_msgs=1000, max_msgs=1000)
-        total_acked += self.stop_producer()
+        msgs = 100
+        self.start_producer(alias_name, cluster2, min_msgs=msgs, max_msgs=msgs)
+        assert self.stop_producer() == msgs
+        total_acked += msgs
 
         self.consume(alias_name, redpanda=cluster2, msg_count=total_acked)
