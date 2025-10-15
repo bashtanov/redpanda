@@ -24,12 +24,14 @@ from rptest.services.admin import (
 )
 from rptest.services.redpanda import RedpandaService
 
+from rptest.tests.redpanda_test import RedpandaTest
+
 
 def now():
     return int(time.time() * 1000)
 
 
-class DataMigrationTestMixin:
+class DataMigrationTestMixin(RedpandaTest):
     def wait_partitions_appear(
         self, topics: list[TopicSpec], redpanda: RedpandaService | None = None
     ):

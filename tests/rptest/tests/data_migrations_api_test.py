@@ -121,7 +121,7 @@ def generate_tmptpdi_params() -> List[TmtpdiParams]:
     ]
 
 
-class DataMigrationsApiTest(RedpandaTest, DataMigrationTestMixin):
+class DataMigrationsApiTest(DataMigrationTestMixin):
     log_segment_size = 10 * 1024
 
     def __init__(self, test_context: TestContext, *args, **kwargs):
@@ -1380,7 +1380,7 @@ class DataMigrationsApiTest(RedpandaTest, DataMigrationTestMixin):
         )
 
 
-class DataMigrationsMultiClusterTest(RedpandaTest, DataMigrationTestMixin):
+class DataMigrationsMultiClusterTest(DataMigrationTestMixin):
     log_segment_size = 10 * 1024
     msg_size = 128
 

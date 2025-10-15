@@ -31,7 +31,7 @@ from rptest.utils.mode_checks import skip_debug_mode
 from rptest.utils.rpcn_utils import counter_stream_config
 
 
-class MountUnmountIcebergTest(RedpandaTest, DataMigrationTestMixin):
+class MountUnmountIcebergTest(DataMigrationTestMixin):
     TOPIC_NAME = "ducky_topic"
     PARTITION_COUNT = 5
     FAST_COMMIT_INTVL_S = 5

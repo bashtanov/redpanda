@@ -16,12 +16,11 @@ from rptest.tests.datalake.datalake_services import DatalakeServices
 from rptest.tests.datalake.datalake_verifier import DatalakeVerifier
 from rptest.tests.datalake.query_engine_base import QueryEngineType
 from rptest.tests.datalake.utils import supported_storage_types
-from rptest.tests.redpanda_test import RedpandaTest
 from rptest.utils.data_migrations import DataMigrationTestMixin
 from rptest.utils.rpcn_utils import counter_stream_config
 
 
-class RedpandaConnectIcebergTest(RedpandaTest, DataMigrationTestMixin):
+class RedpandaConnectIcebergTest(DataMigrationTestMixin):
     TOPIC_NAME = "ducky_topic"
     PARTITION_COUNT = 5
     FAST_COMMIT_INTVL_S = 5
