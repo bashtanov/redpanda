@@ -698,6 +698,16 @@ void backend::schedule_topic_work(model::topic_namespace nt) {
 
     auto& mrstate = _migration_states.find(migration_id)->second;
     auto& tstate = mrstate.outstanding_topics.at(nt);
+    vlog(
+      dm_log.trace,
+      "maybe scheduling topic work migration_id={} nt={}, "
+      "tstate.topic_work_needed={}, tstate.topic_scoped_work_done={}, "
+      "entities_ready={}",
+      migration_id,
+      nt,
+      tstate.topic_scoped_work_needed,
+      tstate.topic_scoped_work_done,
+      mrstate.entities_ready);
     if (!tstate.topic_scoped_work_needed || tstate.topic_scoped_work_done) {
         return;
     }
@@ -754,6 +764,11 @@ backend::do_topic_work(model::topic_namespace nt, topic_work tw) noexcept {
           "older topic work on nt={} completed with errc={}",
           nt,
           old_ec);
+        // carry over cached manifest, if any
+        if (old_tsws->cached_topic_manifest().has_value()) {
+            it->second->cache_topic_manifest(
+              std::move(*old_tsws).release_cached_topic_manifest().value());
+        }
     }
 
     errc ec;
@@ -814,21 +829,67 @@ ss::future<errc> backend::do_topic_work(
         co_return errc::success;
     }
     switch (sought_state) {
-    case state::prepared:
-        co_return co_await retry_loop(rcn, [this, &nt, &itwi, &rcn] {
-            return create_topic(
-              nt, itwi.source, itwi.cloud_storage_location, rcn);
+    case state::prepared: {
+        auto result = co_await maybe_download_topic_manifest(
+          nt, itwi.source, itwi.cloud_storage_location, tsws);
+        if (result.has_error()) {
+            co_return result.error();
+        }
+
+        co_return co_await retry_loop(rcn, [this, &nt, &rcn, &result] {
+            return prepare_mount_topic(nt, result.value(), rcn);
         });
-    case state::executed:
-        co_return co_await retry_loop(
-          rcn, [this, &nt, &rcn] { return prepare_mount_topic(nt, rcn); });
+    }
+    case state::executed: {
+        auto result = co_await maybe_download_topic_manifest(
+          nt, itwi.source, itwi.cloud_storage_location, tsws);
+        if (result.has_error()) {
+            co_return result.error();
+        }
+
+        co_return co_await retry_loop(rcn, [this, &nt, &rcn, &result] {
+            return confirm_mount_topic(nt, result.value(), rcn);
+        });
+    }
     case state::finished: {
-        co_return co_await retry_loop(
-          rcn, [this, &nt, &rcn] { return confirm_mount_topic(nt, rcn); });
+        auto result = co_await maybe_download_topic_manifest(
+          nt, itwi.source, itwi.cloud_storage_location, tsws);
+        if (result.has_error()) {
+            co_return result.error();
+        }
+
+        co_return co_await retry_loop(rcn, [this, &nt, &itwi, &rcn, &result] {
+            return create_topic(nt, itwi.source, result.value(), rcn);
+        });
     }
     case state::cancelled: {
+        auto result = co_await maybe_download_topic_manifest(
+          nt, itwi.source, itwi.cloud_storage_location, tsws);
+        if (result.has_error()) {
+            if (result.error() == errc::topic_not_exists) {
+                // topic manifest missing, nothing to unmount
+                vlog(
+                  dm_log.info,
+                  "topic {} manifest missing, nothing to unmount",
+                  nt);
+                co_return errc::success;
+            }
+
+            vlog(dm_log.warn, "topic {} manifest download failed", nt);
+            co_return errc::topic_operation_error;
+        }
+        auto& manifest = result.value().get();
+        auto& cfg = manifest.get_topic_config();
+        if (!cfg) {
+            vlog(
+              dm_log.warn,
+              "topic {} configuration missing in manifest, cannot unmount",
+              nt);
+            co_return errc::topic_operation_error;
+        }
         // attempt to unmount first
-        auto unmount_res = co_await unmount_topic(nt, rcn);
+        auto unmount_res = co_await unmount_not_existing_topic(
+          nt, manifest, rcn);
         if (unmount_res != errc::success) {
             vlog(
               dm_log.warn, "failed to unmount topic {}: {}", nt, unmount_res);
@@ -858,16 +919,15 @@ ss::future<errc> backend::do_topic_work(
     auto& rcn = tsws->rcn();
     // this switch should be in accordance to the logic in get_work_scope
     switch (sought_state) {
-    case state::finished: {
+    case state::executed: {
         if (nt == model::kafka_consumer_offsets_nt) {
             co_return errc::success;
         }
-        // unmount first
-        auto unmount_res = co_await unmount_topic(nt, rcn);
-        if (unmount_res != errc::success) {
-            vlog(
-              dm_log.warn, "failed to unmount topic {}: {}", nt, unmount_res);
-            co_return unmount_res;
+        co_return co_await unmount_topic(nt, rcn);
+    }
+    case state::finished: {
+        if (nt == model::kafka_consumer_offsets_nt) {
+            co_return errc::success;
         }
         // delete
         co_return co_await delete_topic(nt, rcn);
@@ -896,12 +956,26 @@ ss::future<> backend::abort_all_topic_work() {
         vlog(dm_log.info, "one topic work state completed");
     }
 }
-
-ss::future<errc> backend::create_topic(
-  const model::topic_namespace& local_nt,
+ss::future<
+  result<std::reference_wrapper<const cloud_storage::topic_manifest>, errc>>
+backend::maybe_download_topic_manifest(
+  const model::topic_namespace& nt,
   const std::optional<model::topic_namespace>& original_nt,
   const std::optional<cloud_storage_location>& storage_location,
-  retry_chain_node& rcn) {
+  tsws_lwptr_t tsws) {
+    if (tsws->cached_topic_manifest()) {
+        vlog(
+          dm_log.trace,
+          "using cached topic manifest for topic {} (location {})",
+          original_nt.value_or(nt),
+          storage_location);
+        co_return *tsws->cached_topic_manifest();
+    }
+    vlog(
+      dm_log.debug,
+      "downloading topic manifest for inbound migration topic {} (location {})",
+      original_nt.value_or(nt),
+      storage_location);
     // download manifest
     const auto& bucket_prop = cloud_storage::configuration::get_bucket_config();
     auto maybe_bucket = bucket_prop.value();
@@ -912,28 +986,54 @@ ss::future<errc> backend::create_topic(
       cloud_storage_clients::bucket_name{*maybe_bucket},
       storage_location ? std::make_optional(storage_location->hint)
                        : std::nullopt,
-      original_nt.value_or(local_nt),
+      original_nt.value_or(nt),
       _cloud_storage_api->get()); // checked in frontend::data_migrations_active
-    // todo: is it correct to rely on it checked in frontend?
-    // todo: configure timeout and backoff
+
     auto backoff = std::chrono::duration_cast<model::timestamp_clock::duration>(
-      rcn.get_backoff());
+      tsws->rcn().get_backoff());
     cloud_storage::topic_manifest tm;
     auto download_res = co_await tmd.download_manifest(
-      rcn, rcn.get_deadline(), backoff, &tm);
-    if (
-      !download_res.has_value()
-      || download_res.assume_value()
-           != cloud_storage::find_topic_manifest_outcome::success) {
+      tsws->rcn(), tsws->rcn().get_deadline(), backoff, &tm);
+    if (!download_res.has_value()) {
         vlog(
           dm_log.warn,
           "failed to download manifest for topic {} (storage_location {}): {}",
-          original_nt.value_or(local_nt),
+          original_nt.value_or(nt),
           storage_location,
           download_res);
         co_return errc::topic_operation_error;
     }
-    auto maybe_cfg = tm.get_topic_config();
+    auto download_result = download_res.value();
+    switch (download_result) {
+    case cloud_storage::find_topic_manifest_outcome::success:
+        tsws->cache_topic_manifest(std::move(tm));
+        co_return tsws->cached_topic_manifest().value();
+    case cloud_storage::find_topic_manifest_outcome::no_matching_manifest:
+        vlog(
+          dm_log.warn,
+          "no matching manifest found for topic {} (storage_location {})",
+          original_nt.value_or(nt),
+          storage_location);
+        // map not matching
+        co_return errc::topic_not_exists;
+    case cloud_storage::find_topic_manifest_outcome::
+      multiple_matching_manifests:
+        vlog(
+          dm_log.warn,
+          "multiple matching manifests found for topic {} (storage_location "
+          "{})",
+          original_nt.value_or(nt),
+          storage_location);
+        co_return errc::topic_operation_error;
+    }
+}
+
+ss::future<errc> backend::create_topic(
+  const model::topic_namespace& local_nt,
+  const std::optional<model::topic_namespace>& original_nt,
+  const cloud_storage::topic_manifest& manifest,
+  retry_chain_node& rcn) {
+    auto maybe_cfg = manifest.get_topic_config();
     if (!maybe_cfg) {
         co_return errc::topic_invalid_config;
     }
@@ -955,7 +1055,7 @@ ss::future<errc> backend::create_topic(
         topic_properties.remote_topic_namespace_override = original_nt;
     }
     topic_properties.remote_topic_properties.emplace(
-      tm.get_revision(), maybe_cfg->partition_count);
+      manifest.get_revision(), maybe_cfg->partition_count);
     topic_properties.shadow_indexing = model::shadow_indexing_mode::full;
     topic_properties.recovery = true;
     topic_properties.read_replica = {};
@@ -979,24 +1079,24 @@ ss::future<errc> backend::create_topic(
 }
 
 ss::future<errc> backend::prepare_mount_topic(
-  const model::topic_namespace& nt, retry_chain_node& rcn) {
-    auto cfg = _topic_table.get_topic_cfg(nt);
+  const model::topic_namespace& nt,
+  const cloud_storage::topic_manifest& manifest,
+  retry_chain_node& rcn) {
+    auto& cfg = manifest.get_topic_config();
     if (!cfg) {
-        co_return errc::topic_not_exists;
+        vlog(
+          dm_log.warn,
+          "topic {} configuration missing in manifest, cannot prepare mount",
+          nt);
+        co_return errc::topic_operation_error;
     }
-
-    auto rev_id = _topic_table.get_initial_revision(nt);
-    if (!rev_id) {
-        co_return errc::topic_not_exists;
-    }
-
     vlog(
       dm_log.info,
       "trying to prepare mount topic, cfg={}, rev_id={}",
-      *cfg,
-      *rev_id);
+      manifest.get_topic_config(),
+      manifest.get_revision());
     auto mnt_res = co_await _topic_mount_handler->get().prepare_mount_topic(
-      *cfg, *rev_id, rcn);
+      cfg.value(), manifest.get_revision(), rcn);
     if (mnt_res == cloud_storage::topic_mount_result::mount_manifest_exists) {
         co_return errc::success;
     }
@@ -1005,24 +1105,30 @@ ss::future<errc> backend::prepare_mount_topic(
 }
 
 ss::future<errc> backend::confirm_mount_topic(
-  const model::topic_namespace& nt, retry_chain_node& rcn) {
-    auto cfg = _topic_table.get_topic_cfg(nt);
+  const model::topic_namespace& nt,
+  const cloud_storage::topic_manifest& manifest,
+  retry_chain_node& rcn) {
+    auto& cfg = manifest.get_topic_config();
     if (!cfg) {
-        co_return errc::topic_not_exists;
+        vlog(
+          dm_log.warn,
+          "topic {} configuration missing in manifest, cannot prepare mount",
+          nt);
+        co_return errc::topic_operation_error;
     }
-
-    auto rev_id = _topic_table.get_initial_revision(nt);
-    if (!rev_id) {
-        co_return errc::topic_not_exists;
-    }
+    vlog(
+      dm_log.info,
+      "trying to commit mount topic, cfg={}, rev_id={}",
+      manifest.get_topic_config(),
+      manifest.get_revision());
 
     vlog(
       dm_log.info,
       "trying to confirm mount topic, cfg={}, rev_id={}",
-      *cfg,
-      *rev_id);
+      manifest.get_topic_config(),
+      manifest.get_revision());
     auto mnt_res = co_await _topic_mount_handler->get().confirm_mount_topic(
-      *cfg, *rev_id, rcn);
+      *cfg, manifest.get_revision(), rcn);
     if (
       mnt_res
       != cloud_storage::topic_mount_result::mount_manifest_not_deleted) {
@@ -1047,6 +1153,39 @@ backend::delete_topic(const model::topic_namespace& nt, retry_chain_node& rcn) {
     });
 }
 
+ss::future<errc> backend::unmount_not_existing_topic(
+  const model::topic_namespace& nt,
+  const cloud_storage::topic_manifest& manifest,
+  retry_chain_node& rcn) {
+    return retry_loop(rcn, [this, &nt, &manifest, &rcn] {
+        return do_unmount_not_existing_topic(nt, manifest, rcn);
+    });
+}
+
+ss::future<errc> backend::do_unmount_not_existing_topic(
+  const model::topic_namespace& nt,
+  const cloud_storage::topic_manifest& manifest,
+  retry_chain_node& rcn) {
+    auto& cfg = manifest.get_topic_config();
+    if (!cfg) {
+        vlog(
+          dm_log.warn,
+          "topic {} configuration missing in manifest, cannot unmount",
+          nt);
+        co_return errc::topic_operation_error;
+    }
+
+    auto rev_id = manifest.get_revision();
+
+    auto umnt_res = co_await _topic_mount_handler->get().unmount_topic(
+      *cfg, rev_id, rcn);
+    if (umnt_res == cloud_storage::topic_unmount_result::success) {
+        co_return errc::success;
+    }
+    vlog(dm_log.warn, "failed to unmount topic {}: {}", nt, umnt_res);
+    co_return errc::topic_operation_error;
+}
+
 ss::future<errc> backend::unmount_topic(
   const model::topic_namespace& nt, retry_chain_node& rcn) {
     return retry_loop(
@@ -1055,6 +1194,7 @@ ss::future<errc> backend::unmount_topic(
 
 ss::future<errc> backend::do_unmount_topic(
   const model::topic_namespace& nt, retry_chain_node& rcn) {
+    vlog(dm_log.trace, "trying to unmount {} topic", nt);
     auto cfg = _topic_table.get_topic_cfg(nt);
     if (!cfg) {
         vlog(dm_log.warn, "topic {} missing, ignoring", nt);

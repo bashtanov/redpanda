@@ -10,10 +10,12 @@
  */
 #pragma once
 #include "cloud_storage/fwd.h"
+#include "cloud_storage/topic_manifest.h"
 #include "cloud_storage/topic_mount_handler.h"
 #include "cluster/data_migration_group_proxy.h"
 #include "cluster/data_migration_router.h"
 #include "cluster/data_migration_table.h"
+#include "cluster/errc.h"
 #include "cluster/shard_table.h"
 #include "cluster/types.h"
 #include "container/chunked_hash_map.h"
@@ -145,6 +147,7 @@ private:
         ss::abort_source _as;
         retry_chain_node _rcn;
         ss::shared_promise<errc> _promise;
+        std::optional<cloud_storage::topic_manifest> _cached_topic_manifest;
 
     public:
         topic_scoped_work_state();
@@ -157,6 +160,20 @@ private:
         retry_chain_node& rcn();
         void set_value(errc ec);
         ss::future<errc> future();
+
+        void cache_topic_manifest(cloud_storage::topic_manifest m) {
+            _cached_topic_manifest = std::move(m);
+        }
+
+        const std::optional<cloud_storage::topic_manifest>&
+        cached_topic_manifest() const {
+            return _cached_topic_manifest;
+        }
+
+        std::optional<cloud_storage::topic_manifest>&&
+        release_cached_topic_manifest() && {
+            return std::move(_cached_topic_manifest);
+        }
     };
     using tsws_lwptr_t = ss::lw_shared_ptr<topic_scoped_work_state>;
 
@@ -201,17 +218,42 @@ private:
       tsws_lwptr_t tsws);
     ss::future<> abort_all_topic_work();
     /* topic work helpers */
+    ss::future<
+      result<std::reference_wrapper<const cloud_storage::topic_manifest>, errc>>
+    maybe_download_topic_manifest(
+      const model::topic_namespace& nt,
+      const std::optional<model::topic_namespace>& original_nt,
+      const std::optional<cloud_storage_location>& storage_location,
+      tsws_lwptr_t tsws);
+
     ss::future<errc> create_topic(
       const model::topic_namespace& local_nt,
       const std::optional<model::topic_namespace>& original_nt,
-      const std::optional<cloud_storage_location>& storage_location,
+      const cloud_storage::topic_manifest& manifest,
       retry_chain_node& rcn);
+
     ss::future<errc> prepare_mount_topic(
-      const model::topic_namespace& nt, retry_chain_node& rcn);
+      const model::topic_namespace& nt,
+      const cloud_storage::topic_manifest& manifest,
+      retry_chain_node& rcn);
+
     ss::future<errc> confirm_mount_topic(
-      const model::topic_namespace& nt, retry_chain_node& rcn);
+      const model::topic_namespace& nt,
+      const cloud_storage::topic_manifest& manifest,
+      retry_chain_node& rcn);
     ss::future<errc>
     delete_topic(const model::topic_namespace& nt, retry_chain_node& rcn);
+
+    ss::future<errc> unmount_not_existing_topic(
+      const model::topic_namespace& nt,
+      const cloud_storage::topic_manifest& manifest,
+      retry_chain_node& rcn);
+
+    ss::future<errc> do_unmount_not_existing_topic(
+      const model::topic_namespace& nt,
+      const cloud_storage::topic_manifest& manifest,
+      retry_chain_node& rcn);
+
     ss::future<errc>
     unmount_topic(const model::topic_namespace& nt, retry_chain_node& rcn);
     ss::future<errc>
