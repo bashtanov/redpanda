@@ -72,6 +72,10 @@ private:
         // proceeding to the next step
         bool needs_entity_state_update = false;
 
+        // true if the work requires waiting for all partition work to finish
+        // before proceeding to the next step
+        bool wait_for_partition_work_to_finish = false;
+
         bool any_partition_work_needed() const {
             return data_partition_work_needed || co_partition_work_needed;
         };
@@ -89,6 +93,9 @@ private:
           outstanding_partitions; // for partition scoped ops
         bool topic_scoped_work_needed;
         bool topic_scoped_work_done;
+        bool all_partitions_ready() const {
+            return outstanding_partitions.empty();
+        }
         void clear();
     };
     using topic_map_t = chunked_hash_map<
@@ -175,6 +182,9 @@ private:
     void spawn_advances();
 
     /* topic work */
+    void schedule_topic_work_if_partitions_ready(
+      const model::topic_namespace& nt,
+      const migration_reconciliation_state& mrstate);
     void schedule_topic_work(model::topic_namespace nt);
     ss::future<topic_work_result>
     // also resulting future cannot throw when co_awaited

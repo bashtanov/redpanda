@@ -460,6 +460,20 @@ ss::future<> backend::loop_once() {
     }
 }
 
+void backend::schedule_topic_work_if_partitions_ready(
+  const model::topic_namespace& tp_ns,
+  const backend::migration_reconciliation_state& mrstate) {
+    auto it = mrstate.outstanding_topics.find(tp_ns);
+    if (it == mrstate.outstanding_topics.end()) {
+        // topic already gone, it didn't need to wait for partition work
+        return;
+    }
+
+    if (it->second.all_partitions_ready()) {
+        schedule_topic_work(tp_ns);
+    }
+}
+
 ss::future<> backend::work_once() {
     vlog(dm_log.info, "begin backend work cycle");
     // process pending deltas
@@ -474,8 +488,14 @@ ss::future<> backend::work_once() {
         co_await ssx::async_for_each(
           response.actual_states, [this](const auto& ntp_resp) {
               if (auto rs_it = get_rstate(ntp_resp.migration, ntp_resp.state)) {
-                  mark_migration_step_done_for_ntp(
-                    (*rs_it)->second, ntp_resp.ntp);
+                  auto& mr_state = (*rs_it)->second;
+                  mark_migration_step_done_for_ntp(mr_state, ntp_resp.ntp);
+                  schedule_topic_work_if_partitions_ready(
+                    model::topic_namespace(
+                      ntp_resp.ntp.ns, ntp_resp.ntp.tp.topic),
+                    mr_state);
+                  // advance if done as a last step as it may invalidate the
+                  // reconciliation state iterator.
                   to_advance_if_done(*rs_it);
               }
           });
@@ -684,6 +704,13 @@ void backend::schedule_topic_work(model::topic_namespace nt) {
 
     if (nt == model::kafka_consumer_offsets_nt && !mrstate.entities_ready) {
         // groups topic work must be scheduled only after entities are ready
+        return;
+    }
+    if (
+      mrstate.scope.wait_for_partition_work_to_finish
+      && !tstate.all_partitions_ready()) {
+        // waiting for partitions to finish first
+        vlog(dm_log.trace, "waiting for partitions to finish for nt={}", nt);
         return;
     }
     const auto maybe_migration = _table.get_migration(migration_id);
@@ -1936,35 +1963,45 @@ backend::work_scope backend::get_work_scope(
           .data_partition_work_needed = false,
           .co_partition_work_needed = false,
           .topic_work_needed = true,
-          .needs_entity_state_update = false};
+          .needs_entity_state_update = false,
+          .wait_for_partition_work_to_finish = false,
+        };
     case state::executing:
         return {
           .sought_state = state::executed,
           .data_partition_work_needed = false,
           .co_partition_work_needed = false,
           .topic_work_needed = true,
-          .needs_entity_state_update = true};
+          .needs_entity_state_update = true,
+          .wait_for_partition_work_to_finish = false,
+        };
     case state::cut_over:
         return {
           .sought_state = state::finished,
           .data_partition_work_needed = false,
           .co_partition_work_needed = false,
           .topic_work_needed = true,
-          .needs_entity_state_update = false};
+          .needs_entity_state_update = false,
+          .wait_for_partition_work_to_finish = false,
+        };
     case state::canceling:
         return {
           .sought_state = state::cancelled,
           .data_partition_work_needed = false,
           .co_partition_work_needed = false,
           .topic_work_needed = true,
-          .needs_entity_state_update = false};
+          .needs_entity_state_update = false,
+          .wait_for_partition_work_to_finish = false,
+        };
     default:
         return {
           .sought_state = {},
           .data_partition_work_needed = false,
           .co_partition_work_needed = false,
           .topic_work_needed = false,
-          .needs_entity_state_update = false};
+          .needs_entity_state_update = false,
+          .wait_for_partition_work_to_finish = false,
+        };
     };
 }
 
@@ -1978,35 +2015,44 @@ backend::work_scope backend::get_work_scope(
           .data_partition_work_needed = true,
           .co_partition_work_needed = false,
           .topic_work_needed = false,
-          .needs_entity_state_update = false};
+          .needs_entity_state_update = false,
+          .wait_for_partition_work_to_finish = false,
+        };
     case state::executing:
         return {
           .sought_state = state::executed,
           .data_partition_work_needed = true,
           .co_partition_work_needed = true,
-          .topic_work_needed = false,
-          .needs_entity_state_update = false};
+          .topic_work_needed = true,
+          .needs_entity_state_update = false,
+          .wait_for_partition_work_to_finish = false};
     case state::cut_over:
         return {
           .sought_state = state::finished,
           .data_partition_work_needed = false,
           .co_partition_work_needed = true,
           .topic_work_needed = true,
-          .needs_entity_state_update = false};
+          .needs_entity_state_update = false,
+          .wait_for_partition_work_to_finish = true,
+        };
     case state::canceling:
         return {
           .sought_state = state::cancelled,
           .data_partition_work_needed = true,
           .co_partition_work_needed = true,
           .topic_work_needed = false,
-          .needs_entity_state_update = false};
+          .needs_entity_state_update = false,
+          .wait_for_partition_work_to_finish = false,
+        };
     default:
         return {
           .sought_state = {},
           .data_partition_work_needed = false,
           .co_partition_work_needed = false,
           .topic_work_needed = false,
-          .needs_entity_state_update = false};
+          .needs_entity_state_update = false,
+          .wait_for_partition_work_to_finish = false,
+        };
     };
 }
 
