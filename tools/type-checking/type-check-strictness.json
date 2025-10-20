@@ -244,6 +244,7 @@
         "rptest/transactions/verifiers/consumer_offsets_verifier.py",
         "rptest/trim_results.py",
         "rptest/utils/bookend_collection.py",
+        "rptest/utils/data_migrations.py",
         "rptest/utils/empty_test.py",
         "rptest/utils/full_disk.py",
         "rptest/utils/functional.py",
@@ -483,7 +484,6 @@
         "rptest/transactions/verifiers/stream_verifier.py",
         "rptest/util.py",
         "rptest/utils/cluster_topology.py",
-        "rptest/utils/data_migrations.py",
         "rptest/utils/si_utils.py"
     ],
     "skip": [
